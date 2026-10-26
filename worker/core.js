@@ -54,8 +54,10 @@ export async function handleApi(request,env){
  async function session(role){
   const t=cookies[role==='admin'?'wz_admin':'wz_customer'];if(!t)return null;
   const s=await one('SELECT * FROM sessions WHERE token_hash=? AND role=? AND expires>?',await hash(t),role,now());if(!s)return null;
-  const timeout=(await config()).security.idle_minutes*60000;
-  if(!s.last_active||(!s.idle_exempt&&Date.now()-Date.parse(s.last_active)>timeout)){await q('DELETE FROM sessions WHERE token_hash=?',s.token_hash).run();return null}
+  if(role==='customer'){
+   const timeout=(await config()).security.idle_minutes*60000;
+   if(!s.last_active||(!s.idle_exempt&&Date.now()-Date.parse(s.last_active)>timeout)){await q('DELETE FROM sessions WHERE token_hash=?',s.token_hash).run();return null}
+  }
   if(role==='customer'||s.user_id!=='admin'){
    const c=await one('SELECT disabled,account_type FROM customers WHERE id=?',s.user_id);if(!c||c.disabled||(role==='admin'&&c.account_type!=='developer'))return null;
   }
@@ -221,7 +223,7 @@ export async function handleApi(request,env){
  }
  if(path.startsWith('/api/admin/')){
   await requireAdmin();
-  if(method==='GET'&&path==='/api/admin/me')return json({username:(await adminSession()).user_id==='admin'?'admin':'developer',idle_exempt:!!(await adminSession()).idle_exempt,idle_minutes:(await config()).security.idle_minutes});
+  if(method==='GET'&&path==='/api/admin/me')return json({username:(await adminSession()).user_id==='admin'?'admin':'developer',idle_exempt:true,idle_minutes:0,expires_at:(await adminSession()).expires});
   if(path==='/api/admin/coupons'&&method==='GET')return json({enabled:false,rules_configured:false,can_manage:true,can_issue:false,discount_applied:false,message:'优惠规则尚未配置。管理员与开发者拥有同等发放权限；配置并启用前不能发行或抵扣。'});
   if(path==='/api/admin/coupons/issue'&&method==='POST')bad('优惠券规则尚未配置，暂不能发行优惠券',409);
   if(method==='GET'&&path==='/api/admin/cost-guard')return json(await costStatus(env));
@@ -234,7 +236,8 @@ export async function handleApi(request,env){
    const result=await q("INSERT INTO settings(id,value) VALUES(1,?) ON CONFLICT(id) DO UPDATE SET value=excluded.value WHERE coalesce(json_extract(settings.value,'$.revision'),0)=?",JSON.stringify(next),old.revision).run();if(!result.meta.changes)bad('设置已被另一设备修改，请重新载入',409);return json({ok:true});
   }
   if(method==='POST'&&path==='/api/admin/duty'){
-   const p=await body(request),s=await adminSession();await q('UPDATE sessions SET idle_exempt=?,last_active=? WHERE token_hash=?',p.enabled?1:0,now(),s.token_hash).run();return json({idle_exempt:!!p.enabled});
+   // Compatibility for already-open older pages: merchant idle expiry is always off.
+   await body(request);const s=await adminSession();await q('UPDATE sessions SET idle_exempt=1,last_active=? WHERE token_hash=?',now(),s.token_hash).run();return json({idle_exempt:true});
   }
   if(method==='GET'&&path==='/api/admin/customers'){
    const before=Number(url.searchParams.get('before')||'9999999999999'),list=await rows('SELECT rowid cursor,id,name,phone,wechat,disabled,account_type,login_name,created_at FROM customers WHERE rowid<? ORDER BY rowid DESC LIMIT 101',before);

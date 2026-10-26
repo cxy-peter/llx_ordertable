@@ -230,11 +230,14 @@ test('notifications follow formal-submission events, including old drafts submit
  const c=await customer(),a=(await draft(c)).o,b=(await draft(c)).o;await submit(c,b);const cursor=(await admin.json('/api/admin/updates')).data.cursor;assert.equal((await admin.json('/api/admin/updates?after='+cursor)).data.new_count,0);
  await upload(c,a);assert.equal((await admin.json('/api/admin/updates?after='+cursor)).data.new_count,0);await c.json('/api/orders/'+a.id+'/submit',{});const update=(await admin.json('/api/admin/updates?after='+cursor)).data;assert.equal(update.new_count,1);assert.ok(update.cursor>cursor);assert.equal((await admin.json('/api/admin/updates?after='+update.cursor)).data.new_count,0);
 });
-test('five-minute inactivity expires on server, polling never renews, active interaction does',async()=>{
+test('customer inactivity expires on server; merchant sessions ignore idle but retain absolute expiry',async()=>{
  const c=await customer();let t=new Date(Date.now()-4*60000).toISOString();await db.prepare("UPDATE sessions SET last_active=? WHERE role='customer'").bind(t).run();await c.json('/api/customer/orders');assert.equal((await db.prepare("SELECT last_active FROM sessions WHERE role='customer'").first()).last_active,t);
  await c.json('/api/customer/me',undefined,'GET',{'X-WZ-Active':'1'});assert.ok(Date.parse((await db.prepare("SELECT last_active FROM sessions WHERE role='customer'").first()).last_active)>Date.parse(t));
  t=new Date(Date.now()-6*60000).toISOString();await db.prepare("UPDATE sessions SET last_active=? WHERE role='customer'").bind(t).run();assert.equal((await c.json('/api/customer/me',undefined,'GET',{'X-WZ-Active':'1'})).status,401);
- assert.equal((await admin.json('/api/admin/duty',{enabled:true})).status,200);await db.prepare("UPDATE sessions SET last_active=? WHERE role='admin'").bind(t).run();assert.equal((await admin.json('/api/admin/me')).status,200);await admin.json('/api/admin/duty',{enabled:false});await db.prepare("UPDATE sessions SET last_active=? WHERE role='admin'").bind(t).run();assert.equal((await admin.json('/api/admin/me')).status,401);
+ t=new Date(Date.now()-2*3600000).toISOString();await db.prepare("UPDATE sessions SET last_active=?,idle_exempt=0 WHERE role='admin'").bind(t).run();
+ let me=await admin.json('/api/admin/me');assert.equal(me.status,200);assert.equal(me.data.idle_exempt,true);assert.equal(me.data.idle_minutes,0);assert.ok(Date.parse(me.data.expires_at)>Date.now());
+ assert.equal((await admin.json('/api/admin/duty',{enabled:false})).data.idle_exempt,true);
+ await db.prepare("UPDATE sessions SET expires=? WHERE role='admin'").bind(new Date(Date.now()-1000).toISOString()).run();assert.equal((await admin.json('/api/admin/me')).status,401);
 });
 test('registration blocks honeypot, bad challenge, replay, missing WeChat and enforces invitation',async()=>{
  const c=new Client();let p=await registration(c);assert.equal((await c.json('/api/customer/register',{...p,wechat:''})).status,400);assert.equal((await c.json('/api/customer/register',{...p,website:'bot.invalid'})).status,400);assert.equal((await c.json('/api/customer/register',{...p,answer:'wrong'})).status,400);
@@ -389,6 +392,7 @@ test('developer is a merchant peer, can only create test orders, and downgrade r
  assert.equal((await d.json('/api/admin/login',{username:c.profile.phone,password:'customer-test-pass'})).status,401);
  assert.equal((await admin.json('/api/admin/customer-type',{id:c.profile.id,account_type:'developer',expected_type:'customer'})).status,200);
  assert.equal((await d.json('/api/admin/login',{username:c.profile.phone,password:'customer-test-pass'})).status,200);
+ await db.prepare("UPDATE sessions SET last_active=?,idle_exempt=0 WHERE role='admin' AND user_id=?").bind(new Date(Date.now()-2*3600000).toISOString(),c.profile.id).run();assert.equal((await d.json('/api/admin/me')).data.idle_exempt,true);
  for(const path of ['/api/admin/orders','/api/admin/settings','/api/admin/customers','/api/admin/coupons'])assert.equal((await d.json(path)).status,200,path);
  const {o}=await draft(c,undefined,{is_test:false});assert.equal(o.is_test,true);assert.equal(o.test_only,true);await submit(c,o);assert.equal((await d.json('/api/admin/orders')).data.orders.length,0);assert.equal((await d.json('/api/admin/orders?scope=test')).data.orders[0].id,o.id);
  assert.equal((await d.json('/api/admin/orders/'+o.id+'/kind',{version:(await d.json('/api/orders/'+o.id)).data.version,is_test:false,note:'不可转真实'})).status,400);

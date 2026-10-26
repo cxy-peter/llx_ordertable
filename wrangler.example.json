@@ -19,5 +19,13 @@
       "binding": "BUCKET",
       "bucket_name": "linglongxuan-private"
     }
-  ]
+  ],
+  "vars": {
+    "COST_GUARD_ENABLED": "1"
+  },
+  "triggers": {
+    "crons": [
+      "* * * * *"
+    ]
+  }
 }

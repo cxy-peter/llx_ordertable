@@ -8,6 +8,8 @@ import {passwordHash,hash} from '../worker/core.js';
 import {DEFAULT_CONFIG,currentMenu,nyParts} from '../worker/config.js';
 import {normalizeSettings} from '../worker/settings.js';
 import {purgeMedia} from '../worker/operations.js';
+import {settleDueOrders} from '../worker/fulfillment.js';
+import {guardedStorage,COST_LIMITS,costStatus} from '../worker/cost-guard.js';
 let mf,db,admin;
 const headers={'X-Requested-With':'Weizhuo','Origin':'http://localhost'};
 class Client{
@@ -27,7 +29,7 @@ before(async()=>{
 });
 after(async()=>{await mf?.dispose()});
 beforeEach(async()=>{
- await db.batch(['events','orders','sessions','customers','attempts','settings','tx_guards','challenges','order_history','media_garbage','cleanup_plans'].map(t=>db.prepare('DELETE FROM '+t)));
+ await db.batch(['events','orders','sessions','customers','attempts','settings','tx_guards','challenges','order_history','media_garbage','cleanup_plans','order_references','customer_codes','cost_objects','cost_counters'].map(t=>db.prepare('DELETE FROM '+t)));
  admin=new Client();assert.equal((await admin.json('/api/admin/login',{username:'admin',password:'admin-test-pass'})).status,200);
  const config=normalizeSettings(DEFAULT_CONFIG);config.slots.forEach(s=>{s.cutoff='23:59';s.enabled=true});await db.prepare('INSERT INTO settings VALUES(1,?)').bind(JSON.stringify(config)).run();
 });
@@ -318,4 +320,46 @@ test('failed R2 deletion remains queued for retry and referenced photos cannot s
  const bucket=await mf.getR2Bucket('BUCKET'),key='receipt/qa-delete-retry.jpg';await bucket.put(key,image());await db.prepare('INSERT INTO media_garbage(key,created_at) VALUES(?,?)').bind(key,'2000-01-01T00:00:00Z').run();
  const failed=await purgeMedia({DB:db,BUCKET:{delete:async()=>{throw Error('simulated storage outage')}}});assert.equal(failed.pending,1);assert.ok(await bucket.get(key));assert.equal((await db.prepare('SELECT attempts FROM media_garbage WHERE key=?').bind(key).first()).attempts,1);
  const success=await purgeMedia({DB:db,BUCKET:bucket});assert.equal(success.pending,0);assert.equal(await bucket.get(key),null);
+});
+
+test('display references differ by audience, match by four digits and survive archival',async()=>{
+ const a=await customer(1),b=await customer(2);const [{o:first},{o:second},{o:other}]=await Promise.all([draft(a),draft(a),draft(b)]);
+ assert.equal(new Set([first.check_code,second.check_code,other.check_code]).size,3);
+ assert.deepEqual([first.customer_sequence,second.customer_sequence].sort(),[1,2]);assert.equal(other.customer_sequence,1);
+ await verified(a,first);const merchant=(await admin.json('/api/orders/'+first.id)).data;
+ assert.notEqual(merchant.number,first.number);assert.equal(merchant.number.slice(-4),first.number.slice(-4));assert.match(first.check_code,/^\d{4}$/);
+ const old=await oldClosed(a),prepared=await prepareCleanup([old.id]);assert.equal((await admin.json('/api/admin/retention/confirm',prepared.payload)).status,200);
+ const history=(await a.json('/api/customer/history')).data.history[0];assert.equal(history.number,old.number);assert.equal(history.check_code,old.check_code);
+ const next=(await draft(a)).o;assert.ok(next.customer_sequence>old.customer_sequence);assert.notEqual(next.check_code,old.check_code);
+});
+test('only owning customer can confirm after arrival; manual confirmation is idempotent and cleans photos',async()=>{
+ const c=await customer(1),stranger=await customer(2),{o}=await draft(c);await verified(c,o);
+ let fresh=(await c.json('/api/orders/'+o.id)).data;
+ assert.equal((await c.json('/api/orders/'+o.id+'/confirm-received',{version:fresh.version})).status,409);
+ await action(o,'preparing');await action(o,'dispatched');await action(o,'arrived');fresh=(await c.json('/api/orders/'+o.id)).data;
+ assert.equal(Date.parse(fresh.auto_confirm_at)-Date.parse(fresh.arrived_at),900000);
+ assert.equal((await stranger.json('/api/orders/'+o.id+'/confirm-received',{version:fresh.version})).status,404);
+ assert.equal((await c.json('/api/orders/'+o.id+'/confirm-received',{version:fresh.version})).status,200);
+ assert.equal((await c.json('/api/orders/'+o.id+'/confirm-received',{version:fresh.version})).data.already_done,true);
+ fresh=(await c.json('/api/orders/'+o.id)).data;assert.equal(fresh.confirmed_by,'customer');assert.equal(fresh.has_receipt,false);
+ assert.equal((await admin.json('/api/orders/'+o.id)).data.events.filter(x=>x.action==='顾客确认已收到餐品').length,1);
+});
+test('cloud scheduler confirms at 15 minutes without a browser and rollback cancels the timer',async()=>{
+ const c=await customer(),a=(await draft(c)).o,b=(await draft(c)).o;
+ for(const o of [a,b]){await verified(c,o);await action(o,'preparing');await action(o,'dispatched');await action(o,'arrived')}
+ const fresh=(await c.json('/api/orders/'+a.id)).data,env={DB:db,BUCKET:await mf.getR2Bucket('BUCKET')};
+ assert.equal((await settleDueOrders(env,new Date(Date.parse(fresh.auto_confirm_at)-1).toISOString())).confirmed,0);
+ await action(b,'rollback',{note:'误报送达'});assert.equal((await c.json('/api/orders/'+b.id)).data.auto_confirm_at,null);
+ await db.prepare('UPDATE orders SET auto_confirm_at=? WHERE id=?').bind(new Date(Date.now()-1000).toISOString(),a.id).run();
+ const worker=await import('../dist/server/index.js');let pending;await worker.default.scheduled({},env,{waitUntil:p=>{pending=p}});await pending;
+ const result=await db.prepare('SELECT fulfillment,confirmed_by,receipt FROM orders WHERE id=?').bind(a.id).first();assert.equal(result.fulfillment,'collected');assert.equal(result.confirmed_by,'system');assert.equal(result.receipt,null);
+ assert.equal((await c.json('/api/orders/'+b.id)).data.fulfillment,'dispatched');assert.equal((await settleDueOrders(env)).confirmed,0);
+ const events=(await admin.json('/api/orders/'+a.id)).data.events;assert.equal(events.filter(x=>x.actor==='system'&&x.action.includes('自动确认')).length,1);
+});
+test('cost guard reserves concurrently, stops at limits and permits idempotent cleanup',async()=>{
+ let puts=0,gets=0,deletes=0;const env=guardedStorage({DB:db,COST_GUARD_ENABLED:'1',BUCKET:{put:async()=>{puts++},get:async()=>{gets++;return null},delete:async()=>{deletes++}}});
+ await db.prepare("INSERT INTO cost_counters(key,value) VALUES('stored',?)").bind(COST_LIMITS.stored_bytes-10).run();
+ const result=await Promise.allSettled([env.BUCKET.put('qa/a',new Uint8Array(10)),env.BUCKET.put('qa/b',new Uint8Array(10))]);assert.equal(result.filter(x=>x.status==='fulfilled').length,1);assert.equal(puts,1);
+ const key=(await db.prepare('SELECT key FROM cost_objects').first()).key;await env.BUCKET.delete(key);await env.BUCKET.delete(key);assert.equal((await costStatus(env)).used.stored_bytes,COST_LIMITS.stored_bytes-10);
+ await db.prepare('INSERT INTO cost_counters(key,value) VALUES(?,?)').bind('read:'+new Date().toISOString().slice(0,7),COST_LIMITS.reads_month).run();await assert.rejects(env.BUCKET.get('qa/c'),/保护上限/);assert.equal(gets,0);assert.equal(deletes,2);
 });

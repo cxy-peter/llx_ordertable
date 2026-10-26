@@ -4,6 +4,9 @@ import {xlsx} from './files.js';
 import {validateUploadJpeg} from './uploads.js';
 import {zipSync,strToU8} from 'fflate';
 import {operations,prepInfo,closed,queueMedia,purgeMedia} from './operations.js';
+import {orderReference} from './references.js';
+import {confirmReceipt,settleDueOrders} from './fulfillment.js';
+import {guardedStorage,costStatus,requireUploadCapacity} from './cost-guard.js';
 
 const PAY={unpaid:'未报付款',review:'待核实',verified:'已核实',exception:'付款异常',refund_pending:'退款待处理',refunded:'已退款'};
 const FUL={pending:'待接单',preparing:'备餐中',dispatched:'已发车',arrived:'已到配送点',collected:'已领取',cancelled:'已取消'};
@@ -61,12 +64,12 @@ export async function handleApi(request,env){
  async function requireAdmin(){const s=await adminSession();if(!s)bad('请先登录商家后台',401);return s}
  async function requireCustomer(){const s=await customerSession();if(!s)bad('请先登录顾客账号',401);return s}
  async function authorizedOrder(id){
-  const o=await one('SELECT * FROM orders WHERE id=?',id);if(!o)bad('订单不存在或无权访问',404);
+  const o=await one('SELECT * FROM order_details WHERE id=?',id);if(!o)bad('订单不存在或无权访问',404);
   if((await adminSession())&&o.phase==='submitted')return o;
   const s=await customerSession();if(!s||o.user_id!==s.user_id)bad('订单不存在或尚未正式提交给商家',404);return o;
  }
  function serialize(o,admin=false){const d={...o};for(const k of ['idem_hash','payload_hash','user_id','receipt','arrival_photo'])delete d[k];
-  d.number='ORD-'+String(o.id).padStart(6,'0');d.has_receipt=!!o.receipt;d.has_arrival_photo=!!o.arrival_photo;
+  Object.assign(d,orderReference(o,admin));d.has_receipt=!!o.receipt;d.has_arrival_photo=!!o.arrival_photo;
   for(const k of ['items','pickup_info','session'])d[k]=JSON.parse(o[k]);d.prep=JSON.parse(o.prep||'{}');d.kitchen=prepInfo(o);return d;
  }
  const event=(id,actor,action,note='')=>q('INSERT INTO events(order_id,actor,action,note,created_at) VALUES(?,?,?,?,?)',id,actor,action,note,now());
@@ -86,7 +89,7 @@ export async function handleApi(request,env){
  if(method==='GET'&&path==='/api/health')return json({ok:true,version:4,storage:'cloud-d1-r2',date:nyParts().date});
  if(method==='GET'&&path==='/api/menu'){const m=currentMenu(await config(),url.searchParams.get('slot'));return json({...m,cutoff:snapshotCutoff(m)})}
  if(method==='GET'&&path==='/api/customer/me'){
-  const s=await requireCustomer(),c=await one('SELECT id,phone,name,wechat,profile,profile_version FROM customers WHERE id=?',s.user_id);if(!c)bad('账号不存在',401);return json({...c,profile:JSON.parse(c.profile),idle_minutes:(await config()).security.idle_minutes});
+  const s=await requireCustomer(),c=await one('SELECT id,phone,name,wechat,profile,profile_version,(SELECT code FROM customer_codes WHERE user_id=customers.id) customer_code FROM customers WHERE id=?',s.user_id);if(!c)bad('账号不存在',401);return json({...c,customer_code:'C'+String(c.customer_code).padStart(6,'0'),profile:JSON.parse(c.profile),idle_minutes:(await config()).security.idle_minutes});
  }
  if(method==='GET'&&path==='/api/customer/challenge'){
   const security=(await config()).security;if(!security.registration_open)bad('暂时停止注册，请联系商家',403);
@@ -136,16 +139,16 @@ export async function handleApi(request,env){
   const key=path.includes('/admin/')?'wz_admin':'wz_customer';if(cookies[key])await q('DELETE FROM sessions WHERE token_hash=?',await hash(cookies[key])).run();return json({ok:true},200,{'Set-Cookie':`${key}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${secure}`});
  }
  if(method==='GET'&&path==='/api/customer/orders'){
-  const c=await requireCustomer(),before=Number(url.searchParams.get('before')||'9999999999999'),list=await rows('SELECT * FROM orders WHERE user_id=? AND id<? ORDER BY id DESC LIMIT 101',c.user_id,before);return json({orders:list.slice(0,100).map(o=>serialize(o)),next:list.length>100?list[99].id:null});
+  const c=await requireCustomer(),before=Number(url.searchParams.get('before')||'9999999999999'),list=await rows('SELECT * FROM order_details WHERE user_id=? AND id<? ORDER BY id DESC LIMIT 101',c.user_id,before);return json({orders:list.slice(0,100).map(o=>serialize(o)),next:list.length>100?list[99].id:null});
  }
  if(method==='POST'&&path==='/api/orders'){
   const p=await body(request),staff=!!(await adminSession())&&p.source==='staff',s=staff?{user_id:'staff'}:await requireCustomer();
   const key=text(p,'idempotency_key',100,true);if(!/^[A-Za-z0-9_-]{32,100}$/.test(key))bad('请刷新后重试');const idem=await hash(s.user_id+':'+key);
   const name=text(p,'name',60,true),ph=phone(text(p,'phone',32,true)),wechat=text(p,'wechat',60,true),note=text(p,'note',500);
   const content={name,phone:ph,wechat,note,pickup:p.pickup,pickup_other:p.pickup_other||'',other_confirmed:!!p.other_confirmed,batch:p.batch||'asap',items:p.items,slot:p.slot,date:p.date,expected_total:p.expected_total,source:staff?'staff':'customer'};
-  const payloadHash=await hash(JSON.stringify(content));let existing=await one('SELECT * FROM orders WHERE idem_hash=?',idem);
+  const payloadHash=await hash(JSON.stringify(content));let existing=await one('SELECT * FROM order_details WHERE idem_hash=?',idem);
   if(existing){if(existing.payload_hash!==payloadHash)bad('这次提交已保存，请打开原订单或重新下单',409);return json(serialize(existing))}
-  const settings=await config(),menu=currentMenu(settings,p.slot);
+  await requireUploadCapacity(env);const settings=await config(),menu=currentMenu(settings,p.slot);
   if(p.date!==menu.date)bad('用餐日期已更新，请刷新菜单后重新确认',409);
   if(!staff&&!menu.open)bad('该场次已截止或暂停接单');let pickup=settings.pickups.find(x=>x.id===p.pickup&&x.enabled);
   if(p.pickup==='other'&&settings.other_pickup_enabled){if(!p.other_confirmed)bad('其他地点请先联系商家确认');pickup={id:'other',name:'其他地点（已联系商家）',address:text(p,'pickup_other',200,true),hint:'顾客声明已联系商家，接单前请核对配送范围。',time:'与商家单独约定'}}
@@ -164,13 +167,18 @@ export async function handleApi(request,env){
   await rate('new-order',s.user_id,20,10);const time=now(),phase=staff?'submitted':'draft';
   const snapshot={date:menu.date,session_name:menu.session_name,slot_id:menu.slot_id,cutoff:snapshotCutoff(menu),delivery:menu.delivery,batch_id:batch.id,batch_name:batch.name,departure:batch.time};
   await q(`INSERT OR IGNORE INTO orders(public_id,user_id,idem_hash,payload_hash,name,phone,wechat,pickup,pickup_info,note,session,date,slot,items,subtotal,tax,fee,total,phase,source,submitted_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,uuid(),s.user_id,idem,payloadHash,name,ph,wechat,pickup.id,JSON.stringify(pickup),note,JSON.stringify(snapshot),menu.date,menu.slot_id,JSON.stringify(clean),subtotal,tax,fee,total,phase,staff?'staff':'customer',staff?time:null,time,time).run();
-  const o=await one('SELECT * FROM orders WHERE idem_hash=?',idem);if(o.payload_hash!==payloadHash)bad('重复请求的内容不同',409);
+  const o=await one('SELECT * FROM order_details WHERE idem_hash=?',idem);if(o.payload_hash!==payloadHash)bad('重复请求的内容不同',409);
   await q("INSERT INTO events(order_id,actor,action,note,created_at) SELECT ?,?,?,?,? WHERE NOT EXISTS(SELECT 1 FROM events WHERE order_id=? AND action='创建订单')",o.id,staff?'admin':'customer','创建订单',staff?'商家代客补录':'顾客草稿，尚未提交给商家',time,o.id).run();
   return json(serialize(o),201);
  }
- const match=path.match(/^\/api\/orders\/(\d+)(?:\/(receipt|receipt-meta|contact|submit|arrival-photo|events))?$/);
+ const match=path.match(/^\/api\/orders\/(\d+)(?:\/(receipt|receipt-meta|contact|submit|arrival-photo|events|confirm-received))?$/);
  if(match){const id=Number(match[1]),resource=match[2],o=await authorizedOrder(id);
   if(method==='GET'&&!resource){const d=serialize(o,!!(await adminSession()));if(await adminSession())d.events=await rows('SELECT actor,action,note,created_at FROM events WHERE order_id=? ORDER BY id DESC',id);return json(d)}
+  if(method==='POST'&&resource==='confirm-received'){
+   const s=await requireCustomer();if(o.user_id!==s.user_id)bad('订单不存在或无权访问',404);const p=await body(request);
+   if(o.fulfillment==='collected')return json({ok:true,already_done:true});if(p.version!==o.version)bad('订单状态已更新，请刷新后重试',409);
+   if(!await confirmReceipt(env,o,'customer'))bad('订单状态已更新，请刷新后重试',409);await purgeMedia(env);return json({ok:true});
+  }
   if(method==='GET'&&['receipt','arrival-photo'].includes(resource)){
    const key=resource==='receipt'?o.receipt:o.arrival_photo;if(!key)bad('图片尚未上传',404);const obj=await env.BUCKET.get(key);if(!obj)bad('图片暂时无法读取',404);
    return new Response(obj.body,{headers:{'Content-Type':'image/jpeg','Content-Disposition':'inline','Cache-Control':'private, no-store'}});
@@ -201,12 +209,13 @@ export async function handleApi(request,env){
   }
   if(method==='POST'&&resource==='arrival-photo'){
    await requireAdmin();if(!['dispatched','arrived'].includes(o.fulfillment))bad('请先发车，再上传送达照片');const form=await multipart(),key=await storeImage(form.get('photo'),'arrival');
-   try{await guarded(o,[q("UPDATE orders SET arrival_photo=?,fulfillment='arrived',version=version+1,updated_at=? WHERE id=?",key,now(),id),...queueMedia(q,[o.arrival_photo]),event(id,'admin','已到配送点并上传照片',text(Object.fromEntries(form),'note',500))])}catch(e){await env.BUCKET.delete(key);throw e}await purgeMedia(env);return json({ok:true});
+   try{await guarded(o,[q("UPDATE orders SET arrival_photo=?,fulfillment='arrived',version=version+1,updated_at=?,arrived_at=?,auto_confirm_at=? WHERE id=?",key,now(),o.fulfillment==='arrived'&&o.arrived_at?o.arrived_at:now(),o.fulfillment==='arrived'&&o.auto_confirm_at?o.auto_confirm_at:new Date(Date.now()+900000).toISOString(),id),...queueMedia(q,[o.arrival_photo]),event(id,'admin','已到配送点并上传照片',text(Object.fromEntries(form),'note',500))])}catch(e){await env.BUCKET.delete(key);throw e}await purgeMedia(env);return json({ok:true});
   }
  }
  if(path.startsWith('/api/admin/')){
   await requireAdmin();
   if(method==='GET'&&path==='/api/admin/me')return json({username:'admin',idle_exempt:!!(await adminSession()).idle_exempt,idle_minutes:(await config()).security.idle_minutes});
+  if(method==='GET'&&path==='/api/admin/cost-guard')return json(await costStatus(env));
   if(method==='GET'&&path==='/api/admin/settings'){const s=await config();return json({...s,date:nyParts().date})}
   if(method==='POST'&&path==='/api/admin/settings'){
    const p=await body(request),old=await config();if(p.revision!==old.revision)bad('设置已被另一设备修改，请重新载入后编辑',409);
@@ -231,7 +240,7 @@ export async function handleApi(request,env){
   }
   if(method==='GET'&&path==='/api/admin/orders'){
    const date=url.searchParams.get('date'),before=Number(url.searchParams.get('before')||'9999999999999'),args=[before];let where="phase='submitted' AND id<?";if(date){where+=' AND date=?';args.push(date)}
-   const list=await rows('SELECT * FROM orders WHERE '+where+' ORDER BY id DESC LIMIT 501',...args);
+   const list=await rows('SELECT * FROM order_details WHERE '+where+' ORDER BY id DESC LIMIT 501',...args);
    const outstanding=await one("SELECT count(*) n FROM orders WHERE phase='submitted' AND date<>? AND (payment IN ('review','exception','refund_pending') OR (payment='verified' AND fulfillment NOT IN ('collected','cancelled')))",date||'');
    return json({orders:list.slice(0,500).map(o=>serialize(o,true)),next:list.length>500?list[499].id:null,outstanding_other:outstanding.n,server_time:now()});
   }
@@ -252,21 +261,23 @@ export async function handleApi(request,env){
     if(payment!=='refund_pending'||!note)bad('请填写退款渠道、金额和参考信息');payment='refunded';label='确认退款完成';
    }else if(action==='rollback'){
     if(!['dispatched','arrived'].includes(fulfillment)||!note)bad('仅已发车或已到配送点可退回，请填写纠正原因');
-    const old=fulfillment;fulfillment=old==='arrived'?'dispatched':'preparing';if(old==='arrived')extra.arrival_photo=null;label='纠正配送状态：'+FUL[old]+' → '+FUL[fulfillment];
+    const old=fulfillment;fulfillment=old==='arrived'?'dispatched':'preparing';if(old==='arrived')Object.assign(extra,{arrival_photo:null,arrived_at:null,auto_confirm_at:null});label='纠正配送状态：'+FUL[old]+' → '+FUL[fulfillment];
    }else if(['preparing','dispatched','arrived','collected'].includes(action)){
     const before={preparing:'pending',dispatched:'preparing',arrived:'dispatched',collected:'arrived'}[action];
     if(payment!=='verified'||fulfillment!==before)bad('请先核实到账，并按接单、发车、到达、领取顺序处理');if(action==='dispatched'&&!prepInfo(o).ready)bad('备餐尚未全部完成，请先在备餐清单确认完成数量');fulfillment=action;label=FUL[action];
    }else bad('不支持此操作');
+   if(fulfillment==='arrived'&&o.fulfillment!=='arrived')Object.assign(extra,{arrived_at:now(),auto_confirm_at:new Date(Date.now()+15*60000).toISOString()});
+   if(fulfillment==='collected'&&o.fulfillment!=='collected')Object.assign(extra,{confirmed_at:now(),confirmed_by:'admin'});
    const garbage=[];if(closed({payment,fulfillment})){extra={...extra,receipt:null,arrival_photo:null,media_removed_at:now(),closed_at:o.closed_at||now()};garbage.push(o.receipt,o.arrival_photo)}else if(extra.arrival_photo===null)garbage.push(o.arrival_photo);
    extra={...extra,payment,fulfillment,updated_at:now()};const keys=Object.keys(extra);
    return [q('UPDATE orders SET '+keys.map(k=>k+'=?').join(',')+',version=version+1 WHERE id=?',...Object.values(extra),o.id),...queueMedia(q,garbage),event(o.id,'admin',label,note),...(closed({payment,fulfillment})?[event(o.id,'system','完成后清理图片','订单文字保留，付款及送达图片移出云端；共享照片在最后一笔关联订单结束后删除')]:[])];
   }
   const act=path.match(/^\/api\/admin\/orders\/(\d+)\/action$/);
-  if(method==='POST'&&act){const o=await one('SELECT * FROM orders WHERE id=?',Number(act[1]));if(!o)bad('订单不存在',404);const p=await body(request);await guarded(o,planAction(o,p));return json({ok:true,media:await purgeMedia(env)})}
+  if(method==='POST'&&act){const o=await one('SELECT * FROM order_details WHERE id=?',Number(act[1]));if(!o)bad('订单不存在',404);const p=await body(request);await guarded(o,planAction(o,p));return json({ok:true,media:await purgeMedia(env)})}
   if(method==='POST'&&path==='/api/admin/batch'){
    const p=await body(request);if(!['dispatched','arrived'].includes(p.action)||!Array.isArray(p.orders)||!p.orders.length||p.orders.length>100||new Set(p.orders.map(x=>x.id)).size!==p.orders.length)bad('请选择有效订单及操作');
    const before=p.action==='dispatched'?'preparing':'dispatched';const list=[];
-   for(const item of p.orders){const o=await one('SELECT * FROM orders WHERE id=?',item.id);if(!o||o.phase!=='submitted'||o.payment!=='verified'||o.fulfillment!==before||o.version!==item.version)bad('部分订单已更新或状态不符，请刷新后重试',409);list.push(o)}
+   for(const item of p.orders){const o=await one('SELECT * FROM order_details WHERE id=?',item.id);if(!o||o.phase!=='submitted'||o.payment!=='verified'||o.fulfillment!==before||o.version!==item.version)bad('部分订单已更新或状态不符，请刷新后重试',409);list.push(o)}
    if(new Set(list.map(x=>x.pickup+':'+x.pickup_info+':'+x.date+':'+x.slot+':'+(JSON.parse(x.session).batch_id||'asap'))).size!==1)bad('批量操作必须属于同一天、同场次、同批次、同一配送点');
    let imageKey=null;if(p.photo_order_id){const source=list.find(x=>x.id===p.photo_order_id);imageKey=source?.arrival_photo||null}
    const guards=list.map(guard),statements=guards.map(g=>g[0]);
@@ -276,17 +287,17 @@ export async function handleApi(request,env){
   if(method==='POST'&&path==='/api/admin/arrival'){
    const form=await multipart();let selected;try{selected=JSON.parse(form.get('orders'))}catch{bad('请选择配送订单')}
    if(!Array.isArray(selected)||!selected.length||selected.length>100||new Set(selected.map(x=>x.id)).size!==selected.length)bad('请选择有效订单');
-   const list=[];for(const item of selected){const o=await one("SELECT * FROM orders WHERE id=? AND phase='submitted'",item.id);if(!o||o.payment!=='verified'||!['dispatched','arrived'].includes(o.fulfillment)||o.version!==item.version)bad('部分订单状态已变更，请刷新后重试',409);list.push(o)}
+   const list=[];for(const item of selected){const o=await one("SELECT * FROM order_details WHERE id=? AND phase='submitted'",item.id);if(!o||o.payment!=='verified'||!['dispatched','arrived'].includes(o.fulfillment)||o.version!==item.version)bad('部分订单状态已变更，请刷新后重试',409);list.push(o)}
    if(new Set(list.map(x=>x.pickup+':'+x.pickup_info+':'+x.date+':'+x.slot+':'+(JSON.parse(x.session).batch_id||'asap'))).size!==1)bad('请选择同一天、同场次、同批次、同一配送点的订单');const key=await storeImage(form.get('photo'),'arrival');const pairs=list.map(guard),statements=pairs.map(g=>g[0]);
-   for(const o of list)statements.push(q("UPDATE orders SET arrival_photo=?,fulfillment='arrived',version=version+1,updated_at=? WHERE id=?",key,now(),o.id),...queueMedia(q,[o.arrival_photo]),event(o.id,'admin','已到配送点并上传照片',text(Object.fromEntries(form),'note',500)));statements.push(...pairs.map(g=>g[1]));
+   for(const o of list)statements.push(q("UPDATE orders SET arrival_photo=?,fulfillment='arrived',version=version+1,updated_at=?,arrived_at=?,auto_confirm_at=? WHERE id=?",key,now(),o.fulfillment==='arrived'&&o.arrived_at?o.arrived_at:now(),o.fulfillment==='arrived'&&o.auto_confirm_at?o.auto_confirm_at:new Date(Date.now()+900000).toISOString(),o.id),...queueMedia(q,[o.arrival_photo]),event(o.id,'admin','已到配送点并上传照片',text(Object.fromEntries(form),'note',500)));statements.push(...pairs.map(g=>g[1]));
    try{await DB.batch(statements)}catch(e){await env.BUCKET.delete(key);if(/must_match_version|CHECK constraint/.test(String(e)))bad('订单已更新，请刷新重试',409);throw e}await purgeMedia(env);return json({ok:true,count:list.length});
   }
   if(method==='GET'&&path==='/api/admin/export'){
-   let all=await rows("SELECT * FROM orders WHERE phase='submitted' ORDER BY pickup,id");const date=url.searchParams.get('date'),slot=url.searchParams.get('slot');if(date)all=all.filter(o=>o.date===date);if(slot)all=all.filter(o=>o.slot===slot);const stamp=now();
+   let all=await rows("SELECT * FROM order_details WHERE phase='submitted' ORDER BY pickup,id");const date=url.searchParams.get('date'),slot=url.searchParams.get('slot');if(date)all=all.filter(o=>o.date===date);if(slot)all=all.filter(o=>o.slot===slot);const stamp=now();
    const sheets={'订单总表':[['订单号','姓名','电话','微信号','用餐日期','场次','配送点','应付 USD','税 USD','配送费 USD','渠道','实际付款人','交易编号','付款状态','履约状态','付款凭证','送达照片','实际到账金额','实际币种','换算或差额说明','核实人','核实时间','来源','备注','提交时间','导出时间']],
     '菜品明细表':[['订单号','日期','场次','菜品编号','菜名','规格','数量','单价 USD','小计 USD','付款状态','履约状态','导出时间']],
     '配送点交接单':[['配送点','具体位置','日期','场次','订单号','姓名','电话','菜品与规格','份数','状态','备注','导出时间']]};
-   for(const row of all){const o=serialize(row),number=o.number;
+   for(const row of all){const o=serialize(row,true),number=o.number;
     sheets['订单总表'].push([number,o.name,o.phone,o.wechat,o.date,o.session.session_name+' / '+(o.session.batch_name||'ASAP')+(o.session.departure?' '+o.session.departure:''),o.pickup_info.name,o.total/100,o.tax/100,o.fee/100,o.channel,o.payer,o.transaction_id,PAY[o.payment],FUL[o.fulfillment],o.has_receipt?'已上传':'未上传',o.has_arrival_photo?'已上传':'未上传',o.received_amount==null?'':o.received_amount/100,o.received_currency,o.exchange_basis,o.verified_by,o.verified_at,o.source==='staff'?'商家补录':'顾客',o.note,o.submitted_at,stamp]);
     for(const i of o.items)sheets['菜品明细表'].push([number,o.date,o.session.session_name+' / '+(o.session.batch_name||'ASAP')+(o.session.departure?' '+o.session.departure:''),i.id,i.name,i.option_name,i.qty,i.price/100,i.qty*i.price/100,PAY[o.payment],FUL[o.fulfillment],stamp]);
     if([...ACTIVE,'collected'].includes(o.fulfillment))sheets['配送点交接单'].push([o.pickup_info.name,o.pickup_info.address,o.date,o.session.session_name+' / '+(o.session.batch_name||'ASAP')+(o.session.departure?' '+o.session.departure:''),number,o.name,o.phone,o.items.map(i=>`${i.name}/${i.option_name} × ${i.qty}`).join('；'),o.items.reduce((s,i)=>s+i.qty,0),FUL[o.fulfillment],o.note,stamp]);
@@ -294,7 +305,7 @@ export async function handleApi(request,env){
    return new Response(xlsx(sheets),{headers:{'Content-Type':'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet','Content-Disposition':'attachment; filename="weizhuo-orders.xlsx"'}});
   }
   if(method==='POST'&&path==='/api/admin/backup'){
-   const date=url.searchParams.get('date'),snapshot=await DB.batch([q("SELECT * FROM orders WHERE phase='submitted'"+(date?' AND date=?':''),...(date?[date]:[])),q('SELECT * FROM events'),q('SELECT * FROM customers'),q('SELECT value FROM settings WHERE id=1')]);
+   const date=url.searchParams.get('date'),snapshot=await DB.batch([q("SELECT * FROM order_details WHERE phase='submitted'"+(date?' AND date=?':''),...(date?[date]:[])),q('SELECT * FROM events'),q('SELECT * FROM customers'),q('SELECT value FROM settings WHERE id=1')]);
    const orders=snapshot[0].results,ids=new Set(orders.map(x=>x.id)),users=new Set(orders.map(x=>x.user_id)),ev=snapshot[1].results.filter(x=>ids.has(x.order_id));
    const keys=[...new Set(orders.flatMap(o=>[o.receipt,o.arrival_photo]).filter(Boolean))],files={};let size=0;
    for(const key of keys){const obj=await env.BUCKET.get(key);if(!obj)bad('有图片暂时无法读取，备份未完成，请稍后重试',503);size+=obj.size;if(size>25*1024*1024)bad('该批图片超过 25 MB，请按用餐日期分别备份');files['images/'+key]=new Uint8Array(await obj.arrayBuffer())}
@@ -307,10 +318,14 @@ export async function handleApi(request,env){
 
 export async function apiResponse(request,env){
  try{
+  env=guardedStorage(env);
   if(!['GET','HEAD'].includes(request.method)){
    const origin=request.headers.get('Origin');if(origin&&origin!==new URL(request.url).origin)bad('来源校验失败',403);
    if(request.headers.get('X-Requested-With')!=='Weizhuo')bad('请求校验失败',403);
   }
+  // Cron is authoritative on Cloudflare. Reads also reconcile overdue states
+  // for retained hosts without cron support, without trusting browser clocks.
+  if(request.method==='GET'&&request.headers.has('Cookie')&&/^\/api\/(orders\/\d+$|customer\/orders|admin\/orders)/.test(new URL(request.url).pathname)){const settled=await settleDueOrders(env);if(settled.confirmed)await purgeMedia(env);}
   return await handleApi(request,env);
- }catch(e){if(e instanceof HttpError)return json({error:e.message},e.status);console.error('Request failed:',e?.message);return json({error:'服务暂时无法处理，请稍后重试；已保存的订单会保留。'},503)}
+ }catch(e){if(e instanceof HttpError||[409,503].includes(e.status))return json({error:e.message},e.status);if(/display_number_limit/.test(String(e)))return json({error:'今日订单编号已用尽，请联系商家'},429);console.error('Request failed:',e?.message);return json({error:'服务暂时无法处理，请稍后重试；已保存的订单会保留。'},503)}
 }

@@ -36,6 +36,13 @@
       "when": 1793041997578,
       "tag": "0004_naive_senator_kelly",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "6",
+      "when": 1793047364865,
+      "tag": "0005_bouncy_roland_deschain",
+      "breakpoints": true
     }
   ]
 }

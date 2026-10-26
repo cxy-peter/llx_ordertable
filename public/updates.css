@@ -12,3 +12,5 @@
 .slot-heading{display:flex;align-items:center;justify-content:space-between;gap:8px}.slot-heading small{font-size:10px;font-weight:400;white-space:nowrap}
 .slot-window b{display:block;font-size:19px;font-weight:650;letter-spacing:.2px;font-variant-numeric:tabular-nums}.slot-window small{display:block;margin-top:3px;font-size:11px;font-weight:400}
 @media(max-width:480px){.slot-tabs button{padding:12px 10px}.slot-heading{gap:4px}.slot-heading small{font-size:9px}.slot-window b{font-size:17px}.slot-window small{font-size:10px}}
+
+.reference-label,.order-link,.saved-order h3{overflow-wrap:anywhere;word-break:break-word}.check-code{font-variant-numeric:tabular-nums;letter-spacing:.15em;font-size:1.8rem}.mobile-order-head .order-link{min-width:0;text-align:left}

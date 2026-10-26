@@ -1,10 +1,13 @@
 import ASSETS from 'virtual:assets';
 import {apiResponse} from './core.js';
+import {settleDueOrders} from './fulfillment.js';
+import {guardedStorage} from './cost-guard.js';
+import {purgeMedia} from './operations.js';
 const secureHeaders={
  'X-Content-Type-Options':'nosniff','Referrer-Policy':'no-referrer','X-Frame-Options':'DENY',
  'Content-Security-Policy':"default-src 'self'; img-src 'self' blob: data:; style-src 'self'; script-src 'self' https://challenges.cloudflare.com; connect-src 'self' https://challenges.cloudflare.com; frame-src https://challenges.cloudflare.com; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
 };
-export default {async fetch(request,env){
+export default {async scheduled(event,env,ctx){const guarded=guardedStorage(env);ctx.waitUntil((async()=>{await settleDueOrders(guarded);await purgeMedia(guarded)})())},async fetch(request,env){
  const url=new URL(request.url);let response;
  if(url.pathname.startsWith('/api/'))response=await apiResponse(request,env);
  else{

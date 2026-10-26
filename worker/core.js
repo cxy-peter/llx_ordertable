@@ -4,6 +4,8 @@ import {xlsx} from './files.js';
 import {validateUploadJpeg} from './uploads.js';
 import {zipSync,strToU8} from 'fflate';
 import {operations,prepInfo,closed,queueMedia,purgeMedia} from './operations.js';
+import {navigationGuard} from './navigation-guard.js';
+import {orderScope} from './order-kind.js';
 import {orderReference} from './references.js';
 import {confirmReceipt,settleDueOrders} from './fulfillment.js';
 import {guardedStorage,costStatus,requireUploadCapacity} from './cost-guard.js';
@@ -54,7 +56,9 @@ export async function handleApi(request,env){
   const s=await one('SELECT * FROM sessions WHERE token_hash=? AND role=? AND expires>?',await hash(t),role,now());if(!s)return null;
   const timeout=(await config()).security.idle_minutes*60000;
   if(!s.last_active||(!s.idle_exempt&&Date.now()-Date.parse(s.last_active)>timeout)){await q('DELETE FROM sessions WHERE token_hash=?',s.token_hash).run();return null}
-  if(role==='customer'&&(await one('SELECT disabled FROM customers WHERE id=?',s.user_id))?.disabled)return null;
+  if(role==='customer'||s.user_id!=='admin'){
+   const c=await one('SELECT disabled,account_type FROM customers WHERE id=?',s.user_id);if(!c||c.disabled||(role==='admin'&&c.account_type!=='developer'))return null;
+  }
   if(request.headers.get('X-WZ-Active')==='1'&&Date.now()-Date.parse(s.last_active)>30000)await q('UPDATE sessions SET last_active=? WHERE token_hash=?',now(),s.token_hash).run();
   return s;
  }
@@ -68,8 +72,8 @@ export async function handleApi(request,env){
   if((await adminSession())&&o.phase==='submitted')return o;
   const s=await customerSession();if(!s||o.user_id!==s.user_id)bad('订单不存在或尚未正式提交给商家',404);return o;
  }
- function serialize(o,admin=false){const d={...o};for(const k of ['idem_hash','payload_hash','user_id','receipt','arrival_photo'])delete d[k];
-  Object.assign(d,orderReference(o,admin));d.has_receipt=!!o.receipt;d.has_arrival_photo=!!o.arrival_photo;
+ function serialize(o,admin=false){const d={...o};for(const k of ['idem_hash','payload_hash','user_id','created_by','receipt','arrival_photo'])delete d[k];
+  Object.assign(d,orderReference(o,admin));d.is_test=!!o.is_test;d.test_only=!!o.test_only;d.has_receipt=!!o.receipt;d.has_arrival_photo=!!o.arrival_photo;
   for(const k of ['items','pickup_info','session'])d[k]=JSON.parse(o[k]);d.prep=JSON.parse(o.prep||'{}');d.kitchen=prepInfo(o);return d;
  }
  const event=(id,actor,action,note='')=>q('INSERT INTO events(order_id,actor,action,note,created_at) VALUES(?,?,?,?,?)',id,actor,action,note,now());
@@ -85,11 +89,12 @@ export async function handleApi(request,env){
  async function multipart(){const raw=await boundedBody(request,6*1024*1024);try{return await new Response(raw,{headers:{'Content-Type':request.headers.get('Content-Type')||''}}).formData()}catch{bad('上传格式不正确')}}
  async function storeImage(file,prefix){if(!file||typeof file.arrayBuffer!=='function')bad('请选择图片');if(file.size>5*1024*1024)bad('图片不能超过 5 MB',413);let bytes;try{bytes=validateUploadJpeg(await file.arrayBuffer())}catch(e){bad(e.message)}const key=prefix+'/'+random()+'.jpg';await env.BUCKET.put(key,bytes,{httpMetadata:{contentType:'image/jpeg'}});return key}
 
+ const navigation=await navigationGuard({path,method,request,one,q,rows,body,json,hash,random,rate,adminSession,customerSession,ip});if(navigation)return navigation;
  const operation=await operations({request,path,method,url,env,DB,q,one,rows,body,text,integer,bad,json,hash,random,config,requireAdmin,requireCustomer,guard,guarded,event,serialize,passwordHash,passwordMatches,newSession,rate,phone,checkPassword});if(operation)return operation;
  if(method==='GET'&&path==='/api/health')return json({ok:true,version:4,storage:'cloud-d1-r2',date:nyParts().date});
  if(method==='GET'&&path==='/api/menu'){const m=currentMenu(await config(),url.searchParams.get('slot'));return json({...m,cutoff:snapshotCutoff(m)})}
  if(method==='GET'&&path==='/api/customer/me'){
-  const s=await requireCustomer(),c=await one('SELECT id,phone,name,wechat,profile,profile_version,(SELECT code FROM customer_codes WHERE user_id=customers.id) customer_code FROM customers WHERE id=?',s.user_id);if(!c)bad('账号不存在',401);return json({...c,customer_code:'C'+String(c.customer_code).padStart(6,'0'),profile:JSON.parse(c.profile),idle_minutes:(await config()).security.idle_minutes});
+  const s=await requireCustomer(),c=await one('SELECT id,phone,name,wechat,account_type,login_name,profile,profile_version,(SELECT code FROM customer_codes WHERE user_id=customers.id) customer_code FROM customers WHERE id=?',s.user_id);if(!c)bad('账号不存在',401);return json({...c,customer_code:'C'+String(c.customer_code).padStart(6,'0'),profile:JSON.parse(c.profile),idle_minutes:(await config()).security.idle_minutes});
  }
  if(method==='GET'&&path==='/api/customer/challenge'){
   const security=(await config()).security;if(!security.registration_open)bad('暂时停止注册，请联系商家',403);
@@ -121,12 +126,13 @@ export async function handleApi(request,env){
   return json({id,name,phone:ph,wechat,recovery_code:recovery.match(/.{1,6}/g).join('-')},201,{'Set-Cookie':await newSession(id,'customer')});
  }
  if(method==='POST'&&['/api/customer/login','/api/admin/login'].includes(path)){
-  const p=await body(request),isAdmin=path.includes('/admin/'),identity=isAdmin?text(p,'username',60,true):phone(text(p,'phone',32,true));
+  const p=await body(request),isAdmin=path.includes('/admin/'),rawIdentity=isAdmin?text(p,'username',60,true):text(p,'phone',60,true),identity=/^[a-z][a-z0-9_.-]{2,39}$/i.test(rawIdentity)?rawIdentity.toLowerCase():phone(rawIdentity);
   const key=await rate('login',ip+':'+identity);await rate('login-ip',ip,30);
-  const c=isAdmin?null:await one('SELECT * FROM customers WHERE phone=?',identity);
-  if(typeof p.password!=='string'||p.password.length>128||!(isAdmin?identity==='admin'&&await passwordMatches(p.password,env.ADMIN_PASSWORD_HASH):c&&await passwordMatches(p.password,c.password_hash)))bad('账号或密码不正确',401);
+  const primaryAdmin=isAdmin&&identity==='admin';
+  const c=primaryAdmin?null:await one("SELECT * FROM customers WHERE phone=? OR (login_name=? AND account_type='developer')",identity,identity);
+  if(typeof p.password!=='string'||p.password.length>128||!(primaryAdmin?await passwordMatches(p.password,env.ADMIN_PASSWORD_HASH):c&&(!isAdmin||c.account_type==='developer')&&await passwordMatches(p.password,c.password_hash)))bad('账号或密码不正确',401);
   if(c?.disabled)bad('账号已暂停使用，请联系商家',403);
-  await q('DELETE FROM attempts WHERE key=?',key).run();return json({ok:true,role:isAdmin?'admin':'customer'},200,{'Set-Cookie':await newSession(isAdmin?'admin':c.id,isAdmin?'admin':'customer')});
+  await q('DELETE FROM attempts WHERE key=?',key).run();return json({ok:true,role:isAdmin?'admin':'customer'},200,{'Set-Cookie':await newSession(primaryAdmin?'admin':c.id,isAdmin?'admin':'customer')});
  }
  if(method==='POST'&&path==='/api/customer/reset'){
   const p=await body(request),ph=phone(text(p,'phone',32,true));checkPassword(p.password);await rate('reset',ip+ph,5);await rate('reset-ip',ip,30);
@@ -162,11 +168,12 @@ export async function handleApi(request,env){
   }
   if(clean.reduce((s,i)=>s+i.qty,0)>100)bad('每单最多 100 份');
   const subtotal=clean.reduce((s,i)=>s+i.price*i.qty,0),tax=Math.round(subtotal*settings.tax_bps/10000),fee=settings.fee_cents,total=subtotal+tax+fee;
+  if(p.coupon_code)bad('优惠券暂未开放，当前订单按菜单原价计算',409);
   if(p.expected_total!==total)bad('价格或费用已更新，请刷新菜单后重新确认',409);
   if(!staff&&(await one("SELECT count(*) n FROM orders WHERE user_id=? AND phase='draft' AND date=?",s.user_id,menu.date)).n>=10)bad('今天已有 10 笔未提交草稿，请先完成或联系商家',429);
   await rate('new-order',s.user_id,20,10);const time=now(),phase=staff?'submitted':'draft';
   const snapshot={date:menu.date,session_name:menu.session_name,slot_id:menu.slot_id,cutoff:snapshotCutoff(menu),delivery:menu.delivery,batch_id:batch.id,batch_name:batch.name,departure:batch.time};
-  await q(`INSERT OR IGNORE INTO orders(public_id,user_id,idem_hash,payload_hash,name,phone,wechat,pickup,pickup_info,note,session,date,slot,items,subtotal,tax,fee,total,phase,source,submitted_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,uuid(),s.user_id,idem,payloadHash,name,ph,wechat,pickup.id,JSON.stringify(pickup),note,JSON.stringify(snapshot),menu.date,menu.slot_id,JSON.stringify(clean),subtotal,tax,fee,total,phase,staff?'staff':'customer',staff?time:null,time,time).run();
+  await q(`INSERT OR IGNORE INTO orders(public_id,user_id,idem_hash,payload_hash,name,phone,wechat,pickup,pickup_info,note,session,date,slot,items,subtotal,tax,fee,total,phase,source,submitted_at,created_at,updated_at,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,uuid(),s.user_id,idem,payloadHash,name,ph,wechat,pickup.id,JSON.stringify(pickup),note,JSON.stringify(snapshot),menu.date,menu.slot_id,JSON.stringify(clean),subtotal,tax,fee,total,phase,staff?'staff':'customer',staff?time:null,time,time,staff?(await adminSession()).user_id:s.user_id).run();
   const o=await one('SELECT * FROM order_details WHERE idem_hash=?',idem);if(o.payload_hash!==payloadHash)bad('重复请求的内容不同',409);
   await q("INSERT INTO events(order_id,actor,action,note,created_at) SELECT ?,?,?,?,? WHERE NOT EXISTS(SELECT 1 FROM events WHERE order_id=? AND action='创建订单')",o.id,staff?'admin':'customer','创建订单',staff?'商家代客补录':'顾客草稿，尚未提交给商家',time,o.id).run();
   return json(serialize(o),201);
@@ -214,7 +221,9 @@ export async function handleApi(request,env){
  }
  if(path.startsWith('/api/admin/')){
   await requireAdmin();
-  if(method==='GET'&&path==='/api/admin/me')return json({username:'admin',idle_exempt:!!(await adminSession()).idle_exempt,idle_minutes:(await config()).security.idle_minutes});
+  if(method==='GET'&&path==='/api/admin/me')return json({username:(await adminSession()).user_id==='admin'?'admin':'developer',idle_exempt:!!(await adminSession()).idle_exempt,idle_minutes:(await config()).security.idle_minutes});
+  if(path==='/api/admin/coupons'&&method==='GET')return json({enabled:false,rules_configured:false,can_manage:true,can_issue:false,discount_applied:false,message:'优惠规则尚未配置。管理员与开发者拥有同等发放权限；配置并启用前不能发行或抵扣。'});
+  if(path==='/api/admin/coupons/issue'&&method==='POST')bad('优惠券规则尚未配置，暂不能发行优惠券',409);
   if(method==='GET'&&path==='/api/admin/cost-guard')return json(await costStatus(env));
   if(method==='GET'&&path==='/api/admin/settings'){const s=await config();return json({...s,date:nyParts().date})}
   if(method==='POST'&&path==='/api/admin/settings'){
@@ -228,21 +237,38 @@ export async function handleApi(request,env){
    const p=await body(request),s=await adminSession();await q('UPDATE sessions SET idle_exempt=?,last_active=? WHERE token_hash=?',p.enabled?1:0,now(),s.token_hash).run();return json({idle_exempt:!!p.enabled});
   }
   if(method==='GET'&&path==='/api/admin/customers'){
-   const before=Number(url.searchParams.get('before')||'9999999999999'),list=await rows('SELECT rowid cursor,id,name,phone,wechat,disabled,created_at FROM customers WHERE rowid<? ORDER BY rowid DESC LIMIT 101',before);
+   const before=Number(url.searchParams.get('before')||'9999999999999'),list=await rows('SELECT rowid cursor,id,name,phone,wechat,disabled,account_type,login_name,created_at FROM customers WHERE rowid<? ORDER BY rowid DESC LIMIT 101',before);
    return json({customers:list.slice(0,100),next:list.length>100?list[99].cursor:null});
+  }
+  if(method==='POST'&&path==='/api/admin/developer-account'){
+   const p=await body(request),login=text(p,'login_name',40,true).toLowerCase();if(!/^[a-z][a-z0-9_.-]{2,39}$/.test(login)||login==='admin')bad('开发者登录名格式不正确');checkPassword(p.password);
+   const ph=phone(text(p,'phone',32,true)),name=text(p,'name',60,true),wechat=text(p,'wechat',60,true),id=uuid(),recovery=random().slice(0,36);
+   try{await q("INSERT INTO customers(id,phone,name,wechat,password_hash,recovery_hash,created_at,account_type,login_name) VALUES(?,?,?,?,?,?,?,'developer',?)",id,ph,name,wechat,await passwordHash(p.password),await hash(recovery),now(),login).run()}catch(e){if(/UNIQUE/.test(String(e)))bad('该登录名或手机号已存在，未修改任何密码',409);throw e}
+   return json({id,login_name:login,account_type:'developer',recovery_code:recovery.match(/.{1,6}/g).join('-')});
+  }
+  if(method==='POST'&&path==='/api/admin/customer-type'){
+   const p=await body(request),id=text(p,'id',100,true);if(!['customer','super_customer','developer'].includes(p.account_type))bad('账号类型无效');
+   const changed=await q('UPDATE customers SET account_type=? WHERE id=? AND account_type=?',p.account_type,id,p.expected_type).run();if(!changed.meta.changes)bad('账号已更新，请刷新后重试',409);
+   return json({ok:true});
+  }
+  const kind=path.match(/^\/api\/admin\/orders\/(\d+)\/kind$/);
+  if(method==='POST'&&kind){
+   const p=await body(request),o=await one("SELECT * FROM order_details WHERE id=? AND phase='submitted'",Number(kind[1]));if(!o)bad('订单不存在',404);
+   if(typeof p.is_test!=='boolean')bad('订单类型无效');if(o.test_only&&!p.is_test)bad('开发者创建的订单只能作为测试订单，不可计入真实营业');if(o.version!==p.version)bad('订单已更新，请刷新后重试',409);
+   const reason=text(p,'note',500,true);await guarded(o,[q('UPDATE orders SET is_test=?,version=version+1,updated_at=? WHERE id=?',p.is_test?1:0,now(),o.id),event(o.id,'admin',p.is_test?'标记为测试订单':'恢复为真实订单',reason)]);return json({ok:true});
   }
   if(method==='POST'&&path==='/api/admin/customer-status'){
    const p=await body(request),id=text(p,'id',100,true);await DB.batch([q('UPDATE customers SET disabled=? WHERE id=?',p.disabled?1:0,id),q('DELETE FROM sessions WHERE user_id=?',id)]);return json({ok:true});
   }
   if(method==='GET'&&path==='/api/admin/updates'){
-   const after=Number(url.searchParams.get('after')||0);const result=await one("SELECT count(*) n,coalesce(max(e.id),?) cursor FROM events e JOIN orders o ON e.order_id=o.id WHERE o.phase='submitted' AND e.id>? AND (e.action='正式提交给商家' OR (e.action='创建订单' AND o.source='staff'))",after,after);
+   const after=Number(url.searchParams.get('after')||0);const result=await one("SELECT count(*) n,coalesce(max(e.id),?) cursor FROM events e JOIN orders o ON e.order_id=o.id WHERE o.phase='submitted' AND o.is_test=0 AND e.id>? AND (e.action='正式提交给商家' OR (e.action='创建订单' AND o.source='staff'))",after,after);
    return json({new_count:result.n,cursor:result.cursor,server_time:now()});
   }
   if(method==='GET'&&path==='/api/admin/orders'){
-   const date=url.searchParams.get('date'),before=Number(url.searchParams.get('before')||'9999999999999'),args=[before];let where="phase='submitted' AND id<?";if(date){where+=' AND date=?';args.push(date)}
+   const date=url.searchParams.get('date'),before=Number(url.searchParams.get('before')||'9999999999999'),args=[before],kind=orderScope(url);let where="phase='submitted' AND id<? AND "+kind.sql;if(date){where+=' AND date=?';args.push(date)}
    const list=await rows('SELECT * FROM order_details WHERE '+where+' ORDER BY id DESC LIMIT 501',...args);
-   const outstanding=await one("SELECT count(*) n FROM orders WHERE phase='submitted' AND date<>? AND (payment IN ('review','exception','refund_pending') OR (payment='verified' AND fulfillment NOT IN ('collected','cancelled')))",date||'');
-   return json({orders:list.slice(0,500).map(o=>serialize(o,true)),next:list.length>500?list[499].id:null,outstanding_other:outstanding.n,server_time:now()});
+   const outstanding=await one("SELECT count(*) n FROM orders WHERE phase='submitted' AND is_test=? AND date<>? AND (payment IN ('review','exception','refund_pending') OR (payment='verified' AND fulfillment NOT IN ('collected','cancelled')))",kind.isTest,date||'');
+   return json({scope:kind.scope,orders:list.slice(0,500).map(o=>serialize(o,true)),next:list.length>500?list[499].id:null,outstanding_other:outstanding.n,server_time:now()});
   }
   function planAction(o,p){
    if(o.phase!=='submitted')bad('订单尚未正式提交',404);if(p.version!==o.version)bad('订单已更新，请刷新重试',409);
@@ -293,16 +319,16 @@ export async function handleApi(request,env){
    try{await DB.batch(statements)}catch(e){await env.BUCKET.delete(key);if(/must_match_version|CHECK constraint/.test(String(e)))bad('订单已更新，请刷新重试',409);throw e}await purgeMedia(env);return json({ok:true,count:list.length});
   }
   if(method==='GET'&&path==='/api/admin/export'){
-   let all=await rows("SELECT * FROM order_details WHERE phase='submitted' ORDER BY pickup,id");const date=url.searchParams.get('date'),slot=url.searchParams.get('slot');if(date)all=all.filter(o=>o.date===date);if(slot)all=all.filter(o=>o.slot===slot);const stamp=now();
-   const sheets={'订单总表':[['订单号','姓名','电话','微信号','用餐日期','场次','配送点','应付 USD','税 USD','配送费 USD','渠道','实际付款人','交易编号','付款状态','履约状态','付款凭证','送达照片','实际到账金额','实际币种','换算或差额说明','核实人','核实时间','来源','备注','提交时间','导出时间']],
-    '菜品明细表':[['订单号','日期','场次','菜品编号','菜名','规格','数量','单价 USD','小计 USD','付款状态','履约状态','导出时间']],
-    '配送点交接单':[['配送点','具体位置','日期','场次','订单号','姓名','电话','菜品与规格','份数','状态','备注','导出时间']]};
+   const kind=orderScope(url);let all=await rows("SELECT * FROM order_details WHERE phase='submitted' AND "+kind.sql+" ORDER BY pickup,id");const date=url.searchParams.get('date'),slot=url.searchParams.get('slot');if(date)all=all.filter(o=>o.date===date);if(slot)all=all.filter(o=>o.slot===slot);const stamp=now();
+   const sheets={'订单总表':[['订单号','姓名','电话','微信号','用餐日期','场次','配送点','应付 USD','税 USD','配送费 USD','渠道','实际付款人','交易编号','付款状态','履约状态','付款凭证','送达照片','实际到账金额','实际币种','换算或差额说明','核实人','核实时间','来源','备注','提交时间','导出时间','订单类型']],
+    '菜品明细表':[['订单号','日期','场次','菜品编号','菜名','规格','数量','单价 USD','小计 USD','付款状态','履约状态','导出时间','订单类型']],
+    '配送点交接单':[['配送点','具体位置','日期','场次','订单号','姓名','电话','菜品与规格','份数','状态','备注','导出时间','订单类型']]};
    for(const row of all){const o=serialize(row,true),number=o.number;
-    sheets['订单总表'].push([number,o.name,o.phone,o.wechat,o.date,o.session.session_name+' / '+(o.session.batch_name||'ASAP')+(o.session.departure?' '+o.session.departure:''),o.pickup_info.name,o.total/100,o.tax/100,o.fee/100,o.channel,o.payer,o.transaction_id,PAY[o.payment],FUL[o.fulfillment],o.has_receipt?'已上传':'未上传',o.has_arrival_photo?'已上传':'未上传',o.received_amount==null?'':o.received_amount/100,o.received_currency,o.exchange_basis,o.verified_by,o.verified_at,o.source==='staff'?'商家补录':'顾客',o.note,o.submitted_at,stamp]);
-    for(const i of o.items)sheets['菜品明细表'].push([number,o.date,o.session.session_name+' / '+(o.session.batch_name||'ASAP')+(o.session.departure?' '+o.session.departure:''),i.id,i.name,i.option_name,i.qty,i.price/100,i.qty*i.price/100,PAY[o.payment],FUL[o.fulfillment],stamp]);
-    if([...ACTIVE,'collected'].includes(o.fulfillment))sheets['配送点交接单'].push([o.pickup_info.name,o.pickup_info.address,o.date,o.session.session_name+' / '+(o.session.batch_name||'ASAP')+(o.session.departure?' '+o.session.departure:''),number,o.name,o.phone,o.items.map(i=>`${i.name}/${i.option_name} × ${i.qty}`).join('；'),o.items.reduce((s,i)=>s+i.qty,0),FUL[o.fulfillment],o.note,stamp]);
+    sheets['订单总表'].push([number,o.name,o.phone,o.wechat,o.date,o.session.session_name+' / '+(o.session.batch_name||'ASAP')+(o.session.departure?' '+o.session.departure:''),o.pickup_info.name,o.total/100,o.tax/100,o.fee/100,o.channel,o.payer,o.transaction_id,PAY[o.payment],FUL[o.fulfillment],o.has_receipt?'已上传':'未上传',o.has_arrival_photo?'已上传':'未上传',o.received_amount==null?'':o.received_amount/100,o.received_currency,o.exchange_basis,o.verified_by,o.verified_at,o.source==='staff'?'商家补录':'顾客',o.note,o.submitted_at,stamp,o.is_test?'测试订单（不计营业）':'真实订单']);
+    for(const i of o.items)sheets['菜品明细表'].push([number,o.date,o.session.session_name+' / '+(o.session.batch_name||'ASAP')+(o.session.departure?' '+o.session.departure:''),i.id,i.name,i.option_name,i.qty,i.price/100,i.qty*i.price/100,PAY[o.payment],FUL[o.fulfillment],stamp,o.is_test?'测试订单（不计营业）':'真实订单']);
+    if([...ACTIVE,'collected'].includes(o.fulfillment))sheets['配送点交接单'].push([o.pickup_info.name,o.pickup_info.address,o.date,o.session.session_name+' / '+(o.session.batch_name||'ASAP')+(o.session.departure?' '+o.session.departure:''),number,o.name,o.phone,o.items.map(i=>`${i.name}/${i.option_name} × ${i.qty}`).join('；'),o.items.reduce((s,i)=>s+i.qty,0),FUL[o.fulfillment],o.note,stamp,o.is_test?'测试订单（不计营业）':'真实订单']);
    }
-   return new Response(xlsx(sheets),{headers:{'Content-Type':'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet','Content-Disposition':'attachment; filename="weizhuo-orders.xlsx"'}});
+   return new Response(xlsx(sheets),{headers:{'Content-Type':'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet','Content-Disposition':'attachment; filename="'+(kind.isTest?'weizhuo-test-orders':'weizhuo-orders')+'.xlsx"'}});
   }
   if(method==='POST'&&path==='/api/admin/backup'){
    const date=url.searchParams.get('date'),snapshot=await DB.batch([q("SELECT * FROM order_details WHERE phase='submitted'"+(date?' AND date=?':''),...(date?[date]:[])),q('SELECT * FROM events'),q('SELECT * FROM customers'),q('SELECT value FROM settings WHERE id=1')]);
@@ -327,5 +353,5 @@ export async function apiResponse(request,env){
   // for retained hosts without cron support, without trusting browser clocks.
   if(request.method==='GET'&&request.headers.has('Cookie')&&/^\/api\/(orders\/\d+$|customer\/orders|admin\/orders)/.test(new URL(request.url).pathname)){const settled=await settleDueOrders(env);if(settled.confirmed)await purgeMedia(env);}
   return await handleApi(request,env);
- }catch(e){if(e instanceof HttpError||[409,503].includes(e.status))return json({error:e.message},e.status);if(/display_number_limit/.test(String(e)))return json({error:'今日订单编号已用尽，请联系商家'},429);console.error('Request failed:',e?.message);return json({error:'服务暂时无法处理，请稍后重试；已保存的订单会保留。'},503)}
+ }catch(e){if(e instanceof HttpError||e.name==='OrderKindError'||[409,503].includes(e.status))return json({error:e.message},e.status);if(/display_number_limit/.test(String(e)))return json({error:'今日订单编号已用尽，请联系商家'},429);console.error('Request failed:',e?.message);return json({error:'服务暂时无法处理，请稍后重试；已保存的订单会保留。'},503)}
 }

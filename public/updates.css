@@ -14,3 +14,6 @@
 @media(max-width:480px){.slot-tabs button{padding:12px 10px}.slot-heading{gap:4px}.slot-heading small{font-size:9px}.slot-window b{font-size:17px}.slot-window small{font-size:10px}}
 
 .reference-label,.order-link,.saved-order h3{overflow-wrap:anywhere;word-break:break-word}.check-code{font-variant-numeric:tabular-nums;letter-spacing:.15em;font-size:1.8rem}.mobile-order-head .order-link{min-width:0;text-align:left}
+.risk-dialog{width:min(440px,calc(100% - 32px));border:0;border-radius:20px;padding:28px;color:#233e34;background:#fffdf7;box-shadow:0 24px 80px #0004}
+.risk-dialog::backdrop{background:#12251bb3}
+.risk-dialog h2{margin-top:0}.risk-dialog p{line-height:1.6}.risk-dialog #risk-error{color:#9a3d25}

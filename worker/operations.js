@@ -41,7 +41,7 @@ export async function operations(c){
   return json({ok:true},200,{'Set-Cookie':await newSession(s.user_id,'customer')});
  }
  if(route('GET','/api/customer/history')){
-  const s=await requireCustomer(),before=Number(url.searchParams.get('before')||Number.MAX_SAFE_INTEGER),list=await rows('SELECT h.id,h.date,h.slot,h.items,h.pickup,h.pickup_name,h.archived_at,r.customer_code,r.customer_sequence,r.day_sequence,r.order_created_at FROM order_history h LEFT JOIN order_references r ON r.order_id=h.id WHERE h.user_id=? AND h.id<? ORDER BY h.id DESC LIMIT 101',s.user_id,before);
+  const s=await requireCustomer(),before=Number(url.searchParams.get('before')||Number.MAX_SAFE_INTEGER),list=await rows('SELECT h.id,h.date,h.slot,h.items,h.pickup,h.pickup_name,h.archived_at,h.is_test,r.customer_code,r.customer_sequence,r.day_sequence,r.order_created_at FROM order_history h LEFT JOIN order_references r ON r.order_id=h.id WHERE h.user_id=? AND h.id<? ORDER BY h.id DESC LIMIT 101',s.user_id,before);
   return json({history:list.slice(0,100).map(o=>({...o,items:JSON.parse(o.items),...orderReference(o)})),next:list.length>100?list[99].id:null});
  }
  if(route('POST','/api/customer/reorder')){
@@ -95,7 +95,7 @@ export async function operations(c){
   const pairs=list.map(guard),statements=pairs.map(x=>x[0]),planGuard=random();
   statements.push(q('INSERT INTO tx_guards(id,ok) VALUES(?,coalesce((SELECT CASE WHEN completed_at IS NULL THEN 1 ELSE 0 END FROM cleanup_plans WHERE token_hash=?),0))',planGuard,tokenHash));
   for(const o of list){const pickup=JSON.parse(o.pickup_info),items=JSON.parse(o.items).map(({id,name,option,option_name,price,qty})=>({id,name,option,option_name,price,qty}));
-   if(o.user_id!=='staff')statements.push(q('INSERT OR IGNORE INTO order_history(id,user_id,date,slot,items,pickup,pickup_name,archived_at) VALUES(?,?,?,?,?,?,?,?)',o.id,o.user_id,o.date,o.slot,JSON.stringify(items),o.pickup,pickup.name,stamp()));
+   if(o.user_id!=='staff')statements.push(q('INSERT OR IGNORE INTO order_history(id,user_id,date,slot,items,pickup,pickup_name,archived_at,is_test) VALUES(?,?,?,?,?,?,?,?,?)',o.id,o.user_id,o.date,o.slot,JSON.stringify(items),o.pickup,pickup.name,stamp(),o.is_test));
    statements.push(...queueMedia(q,[o.receipt,o.arrival_photo]),q('DELETE FROM events WHERE order_id=?',o.id),q('DELETE FROM orders WHERE id=?',o.id));
   }
   statements.push(q('UPDATE cleanup_plans SET completed_at=? WHERE token_hash=?',stamp(),tokenHash),q('DELETE FROM tx_guards WHERE id=?',planGuard),...pairs.map(x=>x[1]));

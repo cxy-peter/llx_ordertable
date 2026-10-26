@@ -1,3 +1,5 @@
+function orderTypeBadge(o){return o.is_test?'<span class="badge exception">测试订单 · 不计营业</span>':''}
+function accountTypeLabel(type){return type==='developer'?'开发者用户':type==='super_customer'?'超级消费者':'普通用户'}
 const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
 const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const money=c=>'$'+(c/100).toFixed(2);
@@ -6,11 +8,11 @@ const fulLabels={pending:'待接单',preparing:'备餐中',dispatched:'已发车
 const badge=(v,map)=>`<span class="badge ${esc(v)}">${esc(map[v]||v)}</span>`;
 const dateTime=v=>new Date(v).toLocaleString('zh-CN',{timeZone:'America/New_York',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false});
 function toast(t){$('#toast').textContent=t;$('#toast').classList.add('show');clearTimeout(window.toastTimer);window.toastTimer=setTimeout(()=>$('#toast').classList.remove('show'),4500)}
-async function api(path,opt={}){const headers={'X-Requested-With':'Weizhuo',...opt.headers};if(!document.hidden&&Date.now()-lastInteraction<60000&&Date.now()-lastActivitySent>30000){headers['X-WZ-Active']='1';lastActivitySent=Date.now()}if(opt.body&&!(opt.body instanceof FormData)){headers['Content-Type']='application/json';opt.body=JSON.stringify(opt.body)}let r;try{r=await fetch(path,{...opt,headers,cache:'no-store'})}catch(e){throw new Error('连接中断，数据可能不是最新。请检查网络后重试。')}const data=await r.json();if(!r.ok){const e=new Error(data.error||'请求失败，请重试');e.status=r.status;throw e}return data}
+async function api(path,opt={}){const headers={'X-Requested-With':'Weizhuo',...opt.headers};if(!document.hidden&&Date.now()-lastInteraction<60000&&Date.now()-lastActivitySent>30000){headers['X-WZ-Active']='1';lastActivitySent=Date.now()}if(opt.body&&!(opt.body instanceof FormData)){headers['Content-Type']='application/json';opt.body=JSON.stringify(opt.body)}let r;try{r=await fetch(path,{...opt,headers,cache:'no-store'})}catch(e){throw new Error('连接中断，数据可能不是最新。请检查网络后重试。')}const data=await r.json();if(!r.ok){const e=new Error(data.error||'请求失败，请重试');e.status=r.status;e.challenge=data.challenge;throw e}return data}
 function randomToken(){const a=new Uint8Array(32);crypto.getRandomValues(a);return [...a].map(x=>x.toString(16).padStart(2,'0')).join('')}
 async function copyText(t){try{await navigator.clipboard.writeText(t);toast('已复制')}catch(e){const f=document.createElement('textarea');f.value=t;document.body.append(f);f.select();document.execCommand('copy');f.remove();toast('已复制')}}
 const brand=`<a href="/" class="brand"><img src="/static/logo.svg" alt=""><span>围桌<small>WEIZHUO</small></span></a>`;
-const demoNote=`<div class="demo-note"><span class="pulse"></span> 演示数据 · 请勿付款 · 菜单价格为美元 USD</div>`;
+const demoNote=`<div class="demo-note"><span class="pulse"></span> Jersey City 固定楼宇配送 · 菜单价格均为美元 USD</div>`;
 const batchText=o=>(o.session?.batch_name||'ASAP · 尽快安排')+(o.session?.departure?' · 约 '+o.session.departure+' 发车':'');
 // Background polling must never extend a login. Only real interaction updates this clock.
 let lastInteraction=Date.now(),lastActivitySent=0,idleMinutes=5,idleExempt=false,idleEnabled=false,idleCallback=null;

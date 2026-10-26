@@ -43,6 +43,27 @@
       "when": 1793047364865,
       "tag": "0005_bouncy_roland_deschain",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "6",
+      "when": 1793049183391,
+      "tag": "0006_order_kind",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "6",
+      "when": 1793049390777,
+      "tag": "0007_interaction_guard",
+      "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "6",
+      "when": 1793049697516,
+      "tag": "0008_developer_test_only",
+      "breakpoints": true
     }
   ]
 }

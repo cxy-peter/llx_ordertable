@@ -29,7 +29,7 @@ before(async()=>{
 });
 after(async()=>{await mf?.dispose()});
 beforeEach(async()=>{
- await db.batch(['events','orders','sessions','customers','attempts','settings','tx_guards','challenges','order_history','media_garbage','cleanup_plans','order_references','customer_codes','cost_objects','cost_counters'].map(t=>db.prepare('DELETE FROM '+t)));
+ await db.batch(['events','orders','sessions','customers','attempts','settings','tx_guards','challenges','order_history','media_garbage','cleanup_plans','order_references','customer_codes','cost_objects','cost_counters','interaction_guards'].map(t=>db.prepare('DELETE FROM '+t)));
  admin=new Client();assert.equal((await admin.json('/api/admin/login',{username:'admin',password:'admin-test-pass'})).status,200);
  const config=normalizeSettings(DEFAULT_CONFIG);config.slots.forEach(s=>{s.cutoff='23:59';s.enabled=true});await db.prepare('INSERT INTO settings VALUES(1,?)').bind(JSON.stringify(config)).run();
 });
@@ -362,4 +362,102 @@ test('cost guard reserves concurrently, stops at limits and permits idempotent c
  const result=await Promise.allSettled([env.BUCKET.put('qa/a',new Uint8Array(10)),env.BUCKET.put('qa/b',new Uint8Array(10))]);assert.equal(result.filter(x=>x.status==='fulfilled').length,1);assert.equal(puts,1);
  const key=(await db.prepare('SELECT key FROM cost_objects').first()).key;await env.BUCKET.delete(key);await env.BUCKET.delete(key);assert.equal((await costStatus(env)).used.stored_bytes,COST_LIMITS.stored_bytes-10);
  await db.prepare('INSERT INTO cost_counters(key,value) VALUES(?,?)').bind('read:'+new Date().toISOString().slice(0,7),COST_LIMITS.reads_month).run();await assert.rejects(env.BUCKET.get('qa/c'),/保护上限/);assert.equal(gets,0);assert.equal(deletes,2);
+});
+
+
+test('test orders are excluded from real lists, alerts and every business export sheet',async()=>{
+ const c=await customer(),{o:real}=await draft(c,undefined,{name:'营业顾客'}),{o:testing}=await draft(c,undefined,{name:'不计营业验收',is_test:true});
+ assert.equal(testing.is_test,false);await verified(c,real);await action(real,'preparing');await verified(c,testing);await action(testing,'preparing');
+ const before=(await admin.json('/api/orders/'+testing.id)).data;
+ assert.equal((await c.json('/api/admin/orders/'+testing.id+'/kind',{is_test:true,version:before.version,note:'验收'})).status,401);
+ assert.equal((await admin.json('/api/admin/orders/'+testing.id+'/kind',{is_test:true,version:before.version,note:'验收，不计营业'})).status,200);
+ const ordinary=(await admin.json('/api/admin/orders')).data.orders;assert.deepEqual(ordinary.map(x=>x.id),[real.id]);assert.equal(ordinary.reduce((n,o)=>n+o.total,0),real.total);
+ const tests=(await admin.json('/api/admin/orders?scope=test')).data.orders;assert.deepEqual(tests.map(x=>x.id),[testing.id]);assert.equal(tests[0].kitchen.total,1);
+ assert.equal((await admin.json('/api/admin/updates?after=0')).data.new_count,1);assert.equal((await admin.json('/api/admin/orders?scope=all')).status,400);
+ const files=unzipSync(new Uint8Array(await (await admin.call('/api/admin/export')).arrayBuffer()));
+ for(const [name,data] of Object.entries(files))if(name.startsWith('xl/worksheets/'))assert.ok(!strFromU8(data).includes(tests[0].number));
+ assert.ok(strFromU8(files['xl/worksheets/sheet1.xml']).includes('营业顾客'));assert.ok(!strFromU8(files['xl/worksheets/sheet1.xml']).includes('不计营业验收'));
+ const testExport=await admin.call('/api/admin/export?scope=test');assert.match(testExport.headers.get('content-disposition'),/test-orders/);const tf=unzipSync(new Uint8Array(await testExport.arrayBuffer()));assert.ok(strFromU8(tf['xl/worksheets/sheet1.xml']).includes('测试订单（不计营业）'));
+ assert.equal((await admin.json('/api/admin/orders/'+testing.id+'/kind',{is_test:false,version:before.version,note:'stale'})).status,409);
+ const fresh=(await admin.json('/api/orders/'+testing.id)).data;assert.equal((await admin.json('/api/admin/orders/'+testing.id+'/kind',{is_test:false,version:fresh.version,note:'恢复真实'})).status,200);
+ assert.equal((await admin.json('/api/admin/orders')).data.orders.length,2);
+});
+
+test('developer is a merchant peer, can only create test orders, and downgrade revokes admin access',async()=>{
+ const c=new Client(),registrationBody=await registration(c,9);registrationBody.account_type='developer';registrationBody.name='Peter';const r=await c.json('/api/customer/register',registrationBody);assert.equal(r.status,201);c.profile=r.data;
+ assert.equal((await c.json('/api/customer/me')).data.account_type,'customer');const d=new Client();
+ assert.equal((await d.json('/api/admin/login',{username:c.profile.phone,password:'customer-test-pass'})).status,401);
+ assert.equal((await admin.json('/api/admin/customer-type',{id:c.profile.id,account_type:'developer',expected_type:'customer'})).status,200);
+ assert.equal((await d.json('/api/admin/login',{username:c.profile.phone,password:'customer-test-pass'})).status,200);
+ for(const path of ['/api/admin/orders','/api/admin/settings','/api/admin/customers','/api/admin/coupons'])assert.equal((await d.json(path)).status,200,path);
+ const {o}=await draft(c,undefined,{is_test:false});assert.equal(o.is_test,true);assert.equal(o.test_only,true);await submit(c,o);assert.equal((await d.json('/api/admin/orders')).data.orders.length,0);assert.equal((await d.json('/api/admin/orders?scope=test')).data.orders[0].id,o.id);
+ assert.equal((await d.json('/api/admin/orders/'+o.id+'/kind',{version:(await d.json('/api/orders/'+o.id)).data.version,is_test:false,note:'不可转真实'})).status,400);
+ assert.equal((await d.json('/api/admin/orders/'+o.id+'/action',{action:'verify',version:(await d.json('/api/orders/'+o.id)).data.version,received_amount:o.total,received_currency:'USD'})).status,200);
+ assert.equal((await admin.json('/api/admin/customer-type',{id:c.profile.id,account_type:'customer',expected_type:'developer'})).status,200);
+ assert.equal((await d.json('/api/admin/orders')).status,401);assert.equal((await c.json('/api/customer/orders')).status,200);
+ assert.equal((await c.json('/api/orders/'+o.id)).data.is_test,true);
+});
+
+test('super consumer is exempt but cannot enter backend; new orders remain real after historical test flags',async()=>{
+ const c=await customer(),{o:old}=await draft(c);await submit(c,old);await admin.json('/api/admin/orders/'+old.id+'/kind',{version:(await admin.json('/api/orders/'+old.id)).data.version,is_test:true,note:'以前的测试单'});
+ assert.equal((await admin.json('/api/admin/customer-type',{id:c.profile.id,account_type:'super_customer',expected_type:'customer'})).status,200);
+ assert.equal((await c.json('/api/customer/me')).data.account_type,'super_customer');
+ for(let i=0;i<35;i++)assert.equal((await c.json('/api/navigation',{})).data.exempt,true);
+ const backend=new Client();assert.equal((await backend.json('/api/admin/login',{username:c.profile.phone,password:'customer-test-pass'})).status,401);assert.equal((await c.json('/api/admin/orders')).status,401);
+ const {o}=await draft(c);assert.equal(o.is_test,false);assert.equal(o.test_only,false);await submit(c,o);
+ assert.deepEqual((await admin.json('/api/admin/orders')).data.orders.map(x=>x.id),[o.id]);assert.equal((await c.json('/api/orders/'+old.id)).data.is_test,true);
+});
+
+test('independent developer alias logs in on both pages; staff-created orders are also test-only',async()=>{
+ const input={login_name:'developer',phone:'2025550199',name:'独立开发者',wechat:'demo_developer',password:'developer-test-pass'};
+ const ordinary=await customer();assert.equal((await ordinary.json('/api/admin/developer-account',input)).status,401);
+ const created=await admin.json('/api/admin/developer-account',input);assert.equal(created.status,200);
+ assert.equal((await admin.json('/api/admin/developer-account',input)).status,409);
+ const dev=new Client();assert.equal((await dev.json('/api/customer/login',{phone:'developer',password:input.password})).status,200);assert.equal((await dev.json('/api/customer/me')).data.login_name,'developer');
+ assert.equal((await dev.json('/api/admin/login',{username:'developer',password:input.password})).status,200);
+ assert.equal((await dev.json('/api/admin/coupons')).data.can_manage,true);assert.equal((await dev.json('/api/admin/coupons/issue',{})).status,409);
+ const menu=(await dev.json('/api/menu?slot=lunch')).data;
+ const made=await dev.json('/api/orders',{source:'staff',name:'开发者代客测试',phone:input.phone,wechat:input.wechat,pickup:'jsq2',items:[{id:'fried-noodles',option:'chicken',qty:1}],date:menu.date,slot:'lunch',expected_total:1650,idempotency_key:crypto.randomUUID().replaceAll('-',''),is_test:false});
+ assert.equal(made.status,201);assert.equal(made.data.test_only,true);assert.equal(made.data.is_test,true);assert.ok(!('created_by' in made.data));
+ assert.equal((await admin.json('/api/admin/orders/'+made.data.id+'/kind',{version:made.data.version,is_test:false,note:'主管理员也不能转真实'})).status,400);
+ await assert.rejects(db.prepare('UPDATE orders SET is_test=0 WHERE id=?').bind(made.data.id).run());
+});
+
+test('navigation challenge is server enforced, one use, and preserves saved orders',async()=>{
+ const c=await customer(),{o}=await draft(c);let result;
+ for(let i=0;i<30;i++){result=await c.json('/api/navigation',{});assert.equal(result.status,200)}
+ result=await c.json('/api/navigation',{});assert.equal(result.status,428);const challenge=result.data.challenge;
+ assert.equal((await c.json('/api/customer/orders')).status,428);assert.equal((await c.json('/api/orders/'+o.id)).status,428);
+ assert.ok(!('answer_hash' in challenge));const other=await customer(2);assert.equal((await other.json('/api/navigation/verify',{challenge_id:challenge.id,answer:'1'})).status,400);
+ assert.equal((await c.json('/api/navigation/verify',{challenge_id:challenge.id,answer:'999'})).status,428);
+ const answer=String(challenge.question.match(/\d+/g).map(Number).reduce((a,b)=>a+b));
+ assert.equal((await c.json('/api/navigation/verify',{challenge_id:challenge.id,answer})).status,200);
+ assert.equal((await c.json('/api/navigation/verify',{challenge_id:challenge.id,answer})).status,400);
+ assert.equal((await c.json('/api/orders/'+o.id)).data.id,o.id);assert.equal((await c.json('/api/navigation',{})).status,200);
+});
+
+test('administrator and developer navigation exempt; expired arithmetic challenge rotates',async()=>{
+ const c=await customer();await admin.json('/api/admin/customer-type',{id:c.profile.id,account_type:'developer',expected_type:'customer'});
+ for(let i=0;i<35;i++){assert.equal((await c.json('/api/navigation',{})).data.exempt,true);assert.equal((await admin.json('/api/navigation',{})).data.exempt,true)}
+ assert.equal((await db.prepare('SELECT count(*) n FROM interaction_guards').first()).n,0);
+ await admin.json('/api/admin/customer-type',{id:c.profile.id,account_type:'customer',expected_type:'developer'});
+ let r;for(let i=0;i<31;i++)r=await c.json('/api/navigation',{});const old=r.data.challenge;
+ await db.prepare('UPDATE interaction_guards SET expires=0').run();const answer=String(old.question.match(/\d+/g).map(Number).reduce((a,b)=>a+b));
+ const expired=await c.json('/api/navigation/verify',{challenge_id:old.id,answer});assert.equal(expired.status,428);assert.notEqual(expired.data.challenge.id,old.id);
+});
+
+test('archived simplified history preserves test flag without leaking another user records',async()=>{
+ const c=await customer(),{o}=await draft(c);await verified(c,o);await action(o,'preparing');await action(o,'dispatched');await action(o,'arrived');await action(o,'collected');
+ const fresh=(await admin.json('/api/orders/'+o.id)).data;await admin.json('/api/admin/orders/'+o.id+'/kind',{is_test:true,version:fresh.version,note:'测试归档'});
+ await db.prepare('UPDATE orders SET closed_at=? WHERE id=?').bind(new Date(Date.now()-8*86400000).toISOString(),o.id).run();
+ const prep=await admin.call('/api/admin/retention/prepare',{ids:[o.id]});assert.equal(prep.status,200);
+ const r=await admin.json('/api/admin/retention/confirm',{token:prep.headers.get('X-Cleanup-Token'),archive_hash:prep.headers.get('X-Archive-SHA256'),download_confirmed:true,confirmation:'删除 1 笔旧订单'});assert.equal(r.status,200,JSON.stringify(r.data));
+ const history=(await c.json('/api/customer/history')).data.history;assert.equal(history.length,1);assert.equal(history[0].is_test,1);assert.ok(!('user_id' in history[0]));
+});
+
+test('coupon extension stays disabled and never silently discounts an order',async()=>{
+ const c=await customer();assert.equal((await c.json('/api/admin/coupons')).status,401);
+ const info=(await admin.json('/api/admin/coupons')).data;assert.equal(info.enabled,false);assert.equal(info.can_issue,false);assert.equal(info.can_manage,true);
+ assert.equal((await admin.json('/api/admin/coupons/issue',{})).status,409);
+ const {p}=await draft(c);assert.equal((await c.json('/api/orders',{...p,idempotency_key:crypto.randomUUID().replaceAll('-',''),coupon_code:'FAKE'})).status,409);
 });

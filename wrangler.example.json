@@ -27,5 +27,6 @@
     "crons": [
       "* * * * *"
     ]
-  }
+  },
+  "preview_urls": false
 }

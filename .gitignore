@@ -1,0 +1,15 @@
+dist/
+site.tar.gz
+node_modules/
+.local/
+.wrangler/
+.sites-runtime/
+outputs/
+*.log
+*.pid
+登录信息.txt
+.dev.vars
+.dev.vars.*
+.env
+.env.*
+wrangler.local.json

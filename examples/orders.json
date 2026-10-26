@@ -1,0 +1,78 @@
+{
+  "description": "全部为虚构演示数据；电话号码来自美国保留的 555-01xx 示例段；不是实际付款或订单。",
+  "orders": [
+    {
+      "key": "demo-review",
+      "name": "示例顾客甲",
+      "phone": "+12025550101",
+      "wechat": "demo_customer_a",
+      "pickup": "jsq2",
+      "payment": "review",
+      "fulfillment": "pending",
+      "items": [
+        {
+          "id": "fried-noodles",
+          "option": "chicken",
+          "qty": 1
+        }
+      ],
+      "note": "虚构示例：待核款，实际付款凭证尚未上传"
+    },
+    {
+      "key": "demo-prep",
+      "name": "示例顾客乙",
+      "phone": "+12025550102",
+      "wechat": "demo_customer_b",
+      "pickup": "journal18",
+      "payment": "verified",
+      "fulfillment": "preparing",
+      "items": [
+        {
+          "id": "xiaolongbao",
+          "option": "default",
+          "qty": 2
+        },
+        {
+          "id": "mung-soup",
+          "option": "medium",
+          "qty": 1
+        }
+      ],
+      "note": "虚构示例：备餐中，完成一份小笼包"
+    },
+    {
+      "key": "demo-dispatch",
+      "name": "示例顾客丙",
+      "phone": "+12025550103",
+      "wechat": "demo_customer_c",
+      "pickup": "journal36",
+      "payment": "verified",
+      "fulfillment": "dispatched",
+      "items": [
+        {
+          "id": "fried-noodles",
+          "option": "beef",
+          "qty": 1
+        }
+      ],
+      "note": "虚构示例：已发车"
+    },
+    {
+      "key": "demo-done",
+      "name": "示例顾客丁",
+      "phone": "+12025550104",
+      "wechat": "demo_customer_d",
+      "pickup": "summit626",
+      "payment": "verified",
+      "fulfillment": "collected",
+      "items": [
+        {
+          "id": "shengjianbao",
+          "option": "default",
+          "qty": 1
+        }
+      ],
+      "note": "虚构示例：已领取，可用于再点一单"
+    }
+  ]
+}

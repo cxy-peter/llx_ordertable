@@ -52,13 +52,27 @@ export function nyParts(date=new Date()){
  const p=Object.fromEntries(f.formatToParts(date).map(x=>[x.type,x.value]));return {date:`${p.year}-${p.month}-${p.day}`,time:`${p.hour}:${p.minute}`};
 }
 export function currentMenu(settings,slotId,date=new Date()){
- const s=normalizeSettings(settings),local=nyParts(date),slots=dailySlots(s,local.date).map(slot=>{
-  // Use the whole day's enabled schedule, including earlier departures: this is
-  // the service window, not a list of the batches still available to book.
+ const s=normalizeSettings(settings),local=nyParts(date),tomorrow=nextServiceDate(local.date),todaySlots=dailySlots(s,local.date),slots=todaySlots.map(todaySlot=>{
+  // Cutoff closes today's service, not tomorrow's ordering. Each meal can roll
+  // independently, and tomorrow's menu/schedule must use tomorrow's overrides.
+  const serviceDate=local.time>=todaySlot.cutoff?tomorrow:local.date;
+  const slot=dailySlots(s,serviceDate).find(x=>x.id===todaySlot.id);
   const times=slot.batches.filter(b=>b.enabled).map(b=>b.time).sort();
-  return {...slot,delivery_window:times.length?{start:times[0],end:times.at(-1)}:null};
- });const slot=slots.find(s=>s.id===slotId)||slots.find(s=>s.id===(local.time<'15:00'?'lunch':'dinner'))||slots[0];
- return {...publicSettings(s),slots,date:local.date,session_name:slot.name,slot_id:slot.id,cutoff_time:slot.cutoff,open:slot.enabled&&local.time<slot.cutoff,delivery:slot.delivery,
-  batches:slot.batches.filter(b=>b.enabled).map(b=>({...b,open:local.time<b.time&&local.time<slot.cutoff})),pickups:s.pickups.filter(p=>p.enabled),
-  menu:s.menu.filter(m=>m.available&&m.slots.includes(slot.id)&&(!m.available_date||m.available_date===local.date)),server_time:date.toISOString()};
+  return {...slot,date:serviceDate,is_preorder:serviceDate!==local.date,delivery_window:times.length?{start:times[0],end:times.at(-1)}:null};
+ });const defaultSlot=local.time<todaySlots.find(x=>x.id==='lunch').cutoff||local.time>=todaySlots.find(x=>x.id==='dinner').cutoff?'lunch':'dinner';
+ const slot=slots.find(s=>s.id===slotId)||slots.find(s=>s.id===defaultSlot)||slots[0];
+ return {...publicSettings(s),slots,date:slot.date,today:local.date,tomorrow,is_preorder:slot.is_preorder,session_name:slot.name,slot_id:slot.id,cutoff_time:slot.cutoff,open:slot.enabled&&(slot.is_preorder||local.time<slot.cutoff),delivery:slot.delivery,
+  batches:slot.batches.filter(b=>b.enabled).map(b=>({...b,open:slot.enabled&&(slot.is_preorder||local.time<b.time&&local.time<slot.cutoff)})),pickups:s.pickups.filter(p=>p.enabled),
+  menu:s.menu.filter(m=>m.available&&m.slots.includes(slot.id)&&(!m.available_date||m.available_date===slot.date)),server_time:date.toISOString()};
+}
+export function nextServiceDate(date){return new Date(Date.parse(date+'T12:00:00Z')+86400000).toISOString().slice(0,10)}
+export function serviceCutoff(menu){
+ const wall=Date.parse(`${menu.date}T${menu.cutoff_time}:00Z`);let instant=wall;
+ // Calculate the offset at the service time, including a future DST change.
+ for(let i=0;i<3;i++){
+  const part=new Intl.DateTimeFormat('en-US',{timeZone:'America/New_York',timeZoneName:'longOffset'}).formatToParts(new Date(instant)).find(x=>x.type==='timeZoneName').value;
+  const match=part.match(/GMT([+-])(\d{2}):(\d{2})/),minutes=match?(Number(match[2])*60+Number(match[3]))*(match[1]==='-'?-1:1):0;
+  const corrected=wall-minutes*60000;if(corrected===instant)break;instant=corrected;
+ }
+ return new Date(instant).toISOString();
 }

@@ -5,7 +5,7 @@ import {Miniflare} from 'miniflare';
 import jpeg from 'jpeg-js';
 import {unzipSync,strFromU8} from 'fflate';
 import {passwordHash,hash} from '../worker/core.js';
-import {DEFAULT_CONFIG,currentMenu,nyParts} from '../worker/config.js';
+import {DEFAULT_CONFIG,currentMenu,nyParts,serviceCutoff} from '../worker/config.js';
 import {normalizeSettings} from '../worker/settings.js';
 import {purgeMedia} from '../worker/operations.js';
 import {settleDueOrders} from '../worker/fulfillment.js';
@@ -68,7 +68,7 @@ test('real catalog, eight separate delivery points and exact corrected variant p
 test('daily rollover uses New York date and switches at local midnight including DST',()=>{
  assert.equal(nyParts(new Date('2026-10-27T03:59:00Z')).date,'2026-10-26');assert.equal(nyParts(new Date('2026-10-27T04:00:00Z')).date,'2026-10-27');
  assert.equal(nyParts(new Date('2026-11-03T04:59:00Z')).date,'2026-11-02');assert.equal(nyParts(new Date('2026-11-03T05:00:00Z')).date,'2026-11-03');
- assert.equal(currentMenu(DEFAULT_CONFIG,'lunch',new Date('2026-10-26T19:00:00Z')).open,false);
+ const afterLunch=currentMenu(DEFAULT_CONFIG,'lunch',new Date('2026-10-26T19:00:00Z'));assert.equal(afterLunch.open,true);assert.equal(afterLunch.date,'2026-10-27');
 });
 test('registration, second device login, logout and recovery-code password reset',async()=>{
  const a=await customer(),b=new Client();const {o}=await draft(a);
@@ -100,7 +100,7 @@ test('concurrent customers and concurrent idempotent retries preserve distinct r
  const result=await Promise.all(Array.from({length:6},(_,i)=>draft(c,undefined,{idempotency_key:crypto.randomUUID().replaceAll('-',''),note:'并发 '+i})));assert.equal(new Set(result.map(x=>x.o.id)).size,6);
  assert.equal((await c.json('/api/orders',{...p,name:'改名'})).status,409);assert.equal((await c.json('/api/customer/orders')).data.orders.length,7);
 });
-test('server validates prices, quote, counts, variants and same-day session',async()=>{
+test('server validates prices, quote, counts, variants and offered service date',async()=>{
  const c=await customer(),{p}=await draft(c);const retry=extra=>c.json('/api/orders',{...p,idempotency_key:crypto.randomUUID().replaceAll('-',''),...extra});
  assert.equal((await retry({expected_total:1})).status,409);assert.equal((await retry({date:'2000-01-01'})).status,409);
  for(const change of [{qty:-1},{qty:true},{option:'wrong'},{id:'missing'}])assert.ok((await retry({items:[{id:'fried-noodles',option:'veg',qty:1,...change}]})).status>=400);
@@ -464,4 +464,19 @@ test('coupon extension stays disabled and never silently discounts an order',asy
  const info=(await admin.json('/api/admin/coupons')).data;assert.equal(info.enabled,false);assert.equal(info.can_issue,false);assert.equal(info.can_manage,true);
  assert.equal((await admin.json('/api/admin/coupons/issue',{})).status,409);
  const {p}=await draft(c);assert.equal((await c.json('/api/orders',{...p,idempotency_key:crypto.randomUUID().replaceAll('-',''),coupon_code:'FAKE'})).status,409);
+});
+
+test('after-cutoff preorder saves tomorrow snapshot, keeps idempotent drafts and reaches the correct merchant date',async()=>{
+ const c=await customer(),before=await draft(c),settings=(await admin.json('/api/admin/settings')).data;
+ const tomorrow=new Date(Date.parse(settings.date+'T12:00:00Z')+86400000).toISOString().slice(0,10);
+ settings.day_overrides[tomorrow]={slots:structuredClone(settings.slots)};settings.slots[0].cutoff='00:00';settings.day_overrides[tomorrow].slots[0].cutoff='15:00';
+ assert.equal((await admin.json('/api/admin/settings',settings)).status,200);
+ const menu=(await c.json('/api/menu?slot=lunch')).data;assert.equal(menu.date,tomorrow);assert.equal(menu.open,true);assert.equal(menu.is_preorder,true);
+ assert.equal((await c.json('/api/orders',before.p)).data.id,before.o.id,'retry recovers the original draft rather than moving its date');
+ assert.equal((await c.json('/api/orders',{...before.p,idempotency_key:crypto.randomUUID().replaceAll('-','')})).status,409,'new stale-date order needs explicit reconfirmation');
+ const {o,p}=await draft(c);assert.equal(o.date,tomorrow);assert.equal(o.session.date,tomorrow);assert.equal(o.session.cutoff,serviceCutoff(menu));assert.match(o.session.batch_name,/该用餐日/);
+ const invalidDate=new Date(Date.parse(tomorrow+'T12:00:00Z')+86400000).toISOString().slice(0,10);
+ assert.equal((await c.json('/api/orders',{...p,date:invalidDate,idempotency_key:crypto.randomUUID().replaceAll('-','')})).status,409);
+ await submit(c,o);assert.equal((await admin.json('/api/admin/orders?date='+settings.date)).data.orders.length,0);
+ const future=(await admin.json('/api/admin/orders?date='+tomorrow)).data.orders;assert.equal(future.length,1);assert.equal(future[0].id,o.id);assert.equal((await c.json('/api/orders/'+before.o.id)).data.date,settings.date);
 });

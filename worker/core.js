@@ -1,4 +1,4 @@
-import {DEFAULT_CONFIG,currentMenu,nyParts} from './config.js';
+import {DEFAULT_CONFIG,currentMenu,nyParts,serviceCutoff} from './config.js';
 import {normalizeSettings,validateSettings} from './settings.js';
 import {xlsx} from './files.js';
 import {validateUploadJpeg} from './uploads.js';
@@ -33,8 +33,7 @@ function phone(raw){let p=String(raw).trim().replace(/[()\s.-]/g,'');if(/^\d{10}
 function checkPassword(p){if(typeof p!=='string'||p.length<8||p.length>128)bad('密码需为 8–128 个字符')}
 function integer(v,min,max,label){if(!Number.isInteger(v)||v<min||v>max)bad(label+'不正确');return v}
 function snapshotCutoff(menu){
- const part=new Intl.DateTimeFormat('en-US',{timeZone:'America/New_York',timeZoneName:'longOffset'}).formatToParts(new Date()).find(x=>x.type==='timeZoneName').value;
- return new Date(`${menu.date}T${menu.cutoff_time}:00${part.replace('GMT','')||'+00:00'}`).toISOString();
+ return serviceCutoff(menu);
 }
 async function boundedBody(request,limit){
  if(Number(request.headers.get('Content-Length')||0)>limit)bad('文件或请求太大',413);
@@ -157,11 +156,11 @@ export async function handleApi(request,env){
   const payloadHash=await hash(JSON.stringify(content));let existing=await one('SELECT * FROM order_details WHERE idem_hash=?',idem);
   if(existing){if(existing.payload_hash!==payloadHash)bad('这次提交已保存，请打开原订单或重新下单',409);return json(serialize(existing))}
   await requireUploadCapacity(env);const settings=await config(),menu=currentMenu(settings,p.slot);
-  if(p.date!==menu.date)bad('用餐日期已更新，请刷新菜单后重新确认',409);
-  if(!staff&&!menu.open)bad('该场次已截止或暂停接单');let pickup=settings.pickups.find(x=>x.id===p.pickup&&x.enabled);
+  if(p.date!==menu.date)bad('用餐日期已更新为 '+menu.date+' '+menu.session_name+'，请重新确认配送日期',409);
+  if(!staff&&!menu.open)bad('商家暂停了此日期的场次，请选择其他场次或联系商家');let pickup=settings.pickups.find(x=>x.id===p.pickup&&x.enabled);
   if(p.pickup==='other'&&settings.other_pickup_enabled){if(!p.other_confirmed)bad('其他地点请先联系商家确认');pickup={id:'other',name:'其他地点（已联系商家）',address:text(p,'pickup_other',200,true),hint:'顾客声明已联系商家，接单前请核对配送范围。',time:'与商家单独约定'}}
   if(!pickup)bad('请选择可用配送点');
-  const batchId=p.batch||'asap',batch=batchId==='asap'?{id:'asap',name:'ASAP · 尽快安排',time:''}:menu.batches.find(x=>x.id===batchId&&x.open);if(!batch)bad('所选批次已过时或关闭，请重新选择',409);
+  const batchId=p.batch||'asap',batch=batchId==='asap'?{id:'asap',name:menu.is_preorder?'ASAP · 该用餐日尽快安排':'ASAP · 尽快安排',time:''}:menu.batches.find(x=>x.id===batchId&&x.open);if(!batch)bad('所选批次已过时或关闭，请重新选择',409);
   if(!Array.isArray(p.items)||!p.items.length||p.items.length>40)bad('请先选择餐品');
   const clean=[],seen=new Map();
   for(const i of p.items){if(!i||typeof i!=='object')bad('菜品格式不正确');const m=menu.menu.find(x=>x.id===i.id),opt=m?.options.find(x=>x.id===i.option);

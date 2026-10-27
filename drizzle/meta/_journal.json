@@ -64,6 +64,20 @@
       "when": 1793049697516,
       "tag": "0008_developer_test_only",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "6",
+      "when": 1793068395273,
+      "tag": "0009_phone_notifications",
+      "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "6",
+      "when": 1793068772670,
+      "tag": "0010_wechat_notifications",
+      "breakpoints": true
     }
   ]
 }

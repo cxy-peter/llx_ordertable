@@ -5,6 +5,7 @@ import {validateUploadJpeg} from './uploads.js';
 import {zipSync,strToU8} from 'fflate';
 import {operations,prepInfo,closed,queueMedia,purgeMedia} from './operations.js';
 import {navigationGuard} from './navigation-guard.js';
+import {notificationRoutes} from './notifications.js';
 import {orderScope} from './order-kind.js';
 import {orderReference} from './references.js';
 import {confirmReceipt,settleDueOrders} from './fulfillment.js';
@@ -91,6 +92,7 @@ export async function handleApi(request,env){
  async function storeImage(file,prefix){if(!file||typeof file.arrayBuffer!=='function')bad('请选择图片');if(file.size>5*1024*1024)bad('图片不能超过 5 MB',413);let bytes;try{bytes=validateUploadJpeg(await file.arrayBuffer())}catch(e){bad(e.message)}const key=prefix+'/'+random()+'.jpg';await env.BUCKET.put(key,bytes,{httpMetadata:{contentType:'image/jpeg'}});return key}
 
  const navigation=await navigationGuard({path,method,request,one,q,rows,body,json,hash,random,rate,adminSession,customerSession,ip});if(navigation)return navigation;
+ const notification=await notificationRoutes({path,method,request,one,rows,q,DB,body,text,integer,json,rate,url,requireAdmin});if(notification)return notification;
  const operation=await operations({request,path,method,url,env,DB,q,one,rows,body,text,integer,bad,json,hash,random,config,requireAdmin,requireCustomer,guard,guarded,event,serialize,passwordHash,passwordMatches,newSession,rate,phone,checkPassword});if(operation)return operation;
  if(method==='GET'&&path==='/api/health')return json({ok:true,version:4,storage:'cloud-d1-r2',date:nyParts().date});
  if(method==='GET'&&path==='/api/menu'){const m=currentMenu(await config(),url.searchParams.get('slot'));return json({...m,cutoff:snapshotCutoff(m)})}
@@ -355,5 +357,5 @@ export async function apiResponse(request,env){
   // for retained hosts without cron support, without trusting browser clocks.
   if(request.method==='GET'&&request.headers.has('Cookie')&&/^\/api\/(orders\/\d+$|customer\/orders|admin\/orders)/.test(new URL(request.url).pathname)){const settled=await settleDueOrders(env);if(settled.confirmed)await purgeMedia(env);}
   return await handleApi(request,env);
- }catch(e){if(e instanceof HttpError||e.name==='OrderKindError'||[409,503].includes(e.status))return json({error:e.message},e.status);if(/display_number_limit/.test(String(e)))return json({error:'今日订单编号已用尽，请联系商家'},429);console.error('Request failed:',e?.message);return json({error:'服务暂时无法处理，请稍后重试；已保存的订单会保留。'},503)}
+ }catch(e){if(e instanceof HttpError||['OrderKindError','NotificationError'].includes(e.name)||[409,503].includes(e.status))return json({error:e.message},e.status);if(/display_number_limit/.test(String(e)))return json({error:'今日订单编号已用尽，请联系商家'},429);console.error('Request failed:',e?.message);return json({error:'服务暂时无法处理，请稍后重试；已保存的订单会保留。'},503)}
 }
